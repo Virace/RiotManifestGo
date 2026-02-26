@@ -36,3 +36,6 @@ go.work.sum
 
 # ai
 .ai_memory/
+
+# spec doc (internal only)
+RIOT_MANIFEST_GO_REWRITE_SPEC.md

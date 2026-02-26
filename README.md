@@ -1,0 +1,2 @@
+# RiotManifestGo
+基于Go语言对ManifestDownloader的重构

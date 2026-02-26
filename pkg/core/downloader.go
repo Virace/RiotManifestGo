@@ -14,6 +14,24 @@ import (
 	"github.com/Virace/RiotManifestGo/pkg/rman"
 )
 
+// netBundleFetcherAdapter 将 *netpool.BundleClient 适配为 BundleFetcher 接口。
+// 负责 core.ByteRange ↔ netpool.ByteRange 的类型转换。
+type netBundleFetcherAdapter struct {
+	client *netpool.BundleClient
+}
+
+func (a *netBundleFetcherAdapter) FetchRanges(ctx context.Context, bundleFilename string, ranges []ByteRange) ([][]byte, error) {
+	npRanges := make([]netpool.ByteRange, len(ranges))
+	for i, r := range ranges {
+		npRanges[i] = netpool.ByteRange{Start: r.Start, End: r.End}
+	}
+	return a.client.FetchRanges(ctx, bundleFilename, npRanges)
+}
+
+func (a *netBundleFetcherAdapter) Close() {
+	a.client.Close()
+}
+
 // DownloadConfig 是 Downloader 的配置参数。
 type DownloadConfig struct {
 	// CDNBaseURL CDN Bundle 文件的基础 URL
@@ -42,7 +60,7 @@ type DownloadConfig struct {
 type Downloader struct {
 	config   DownloadConfig
 	events   chan DownloadEvent
-	client   *netpool.BundleClient
+	client   BundleFetcher
 	filePool *fswriter.FilePool
 	decoder  *zstream.Decoder
 
@@ -52,6 +70,19 @@ type Downloader struct {
 
 // NewDownloader 创建一个新的下载协调器。
 func NewDownloader(config DownloadConfig) *Downloader {
+	client := &netBundleFetcherAdapter{
+		client: netpool.NewBundleClient(config.CDNBaseURL, config.Workers),
+	}
+	return newDownloader(config, client)
+}
+
+// NewDownloaderWithFetcher 创建一个使用自定义 BundleFetcher 的下载协调器。
+// 主要用于测试时注入 mock 实现。
+func NewDownloaderWithFetcher(config DownloadConfig, fetcher BundleFetcher) *Downloader {
+	return newDownloader(config, fetcher)
+}
+
+func newDownloader(config DownloadConfig, fetcher BundleFetcher) *Downloader {
 	if config.Workers <= 0 {
 		config.Workers = 16
 	}
@@ -68,7 +99,7 @@ func NewDownloader(config DownloadConfig) *Downloader {
 	return &Downloader{
 		config:   config,
 		events:   make(chan DownloadEvent, config.Workers*4),
-		client:   netpool.NewBundleClient(config.CDNBaseURL, config.Workers),
+		client:   fetcher,
 		filePool: fswriter.NewFilePool(config.MaxFileHandles),
 		decoder:  zstream.NewDecoder(),
 	}
@@ -234,9 +265,9 @@ func (d *Downloader) processBundle(ctx context.Context, job BundleJob) error {
 		ChunkCount:     chunkCount,
 	}
 
-	byteRanges := make([]netpool.ByteRange, len(job.Ranges))
+	byteRanges := make([]ByteRange, len(job.Ranges))
 	for i, r := range job.Ranges {
-		byteRanges[i] = netpool.ByteRange{Start: int64(r.Start), End: int64(r.End)}
+		byteRanges[i] = ByteRange{Start: int64(r.Start), End: int64(r.End)}
 	}
 
 	rangeDatas, err := d.client.FetchRanges(ctx, job.BundleFilename, byteRanges)

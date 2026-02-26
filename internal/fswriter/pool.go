@@ -28,8 +28,10 @@ type FilePool struct {
 }
 
 type poolEntry struct {
-	path string
-	file *os.File
+	path    string
+	file    *os.File
+	refs    int
+	evicted bool
 }
 
 // NewFilePool 创建一个新的 LRU 文件句柄池。
@@ -46,11 +48,21 @@ func NewFilePool(maxHandles int) *FilePool {
 
 // WriteAt 将 data 写入指定文件的指定偏移（pwrite 语义，不同 offset 天然并发安全）。
 func (p *FilePool) WriteAt(path string, data []byte, offset int64) (int, error) {
-	f, err := p.get(path)
+	entry, err := p.get(path)
 	if err != nil {
 		return 0, err
 	}
-	return f.WriteAt(data, offset)
+	defer p.release(entry)
+	return entry.file.WriteAt(data, offset)
+}
+
+func (p *FilePool) release(entry *poolEntry) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry.refs--
+	if entry.refs == 0 && entry.evicted {
+		entry.file.Close()
+	}
 }
 
 // PreallocateFile 预分配文件空间：创建父目录 + Truncate 到指定大小。
@@ -81,8 +93,11 @@ func (p *FilePool) Close() error {
 	var lastErr error
 	for _, elem := range p.handles {
 		entry := elem.Value.(*poolEntry)
-		if err := entry.file.Close(); err != nil {
-			lastErr = err
+		entry.evicted = true
+		if entry.refs == 0 {
+			if err := entry.file.Close(); err != nil {
+				lastErr = err
+			}
 		}
 	}
 	p.handles = make(map[string]*list.Element)
@@ -90,13 +105,15 @@ func (p *FilePool) Close() error {
 	return lastErr
 }
 
-func (p *FilePool) get(path string) (*os.File, error) {
+func (p *FilePool) get(path string) (*poolEntry, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if elem, ok := p.handles[path]; ok {
 		p.lru.MoveToFront(elem)
-		return elem.Value.(*poolEntry).file, nil
+		entry := elem.Value.(*poolEntry)
+		entry.refs++
+		return entry, nil
 	}
 
 	for p.lru.Len() >= p.maxHandles {
@@ -108,10 +125,10 @@ func (p *FilePool) get(path string) (*os.File, error) {
 		return nil, fmt.Errorf("打开文件失败 %s: %w", path, err)
 	}
 
-	entry := &poolEntry{path: path, file: f}
+	entry := &poolEntry{path: path, file: f, refs: 1}
 	elem := p.lru.PushFront(entry)
 	p.handles[path] = elem
-	return f, nil
+	return entry, nil
 }
 
 func (p *FilePool) evict() {
@@ -121,5 +138,8 @@ func (p *FilePool) evict() {
 	}
 	entry := p.lru.Remove(back).(*poolEntry)
 	delete(p.handles, entry.path)
-	entry.file.Close()
+	entry.evicted = true
+	if entry.refs == 0 {
+		entry.file.Close()
+	}
 }

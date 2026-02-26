@@ -342,7 +342,10 @@ func loadManifest(source string) (*rman.Manifest, error) {
 }
 
 func loadManifestFromURL(url string) (*rman.Manifest, error) {
-	resp, err := http.Get(url)
+	client := &http.Client{
+		Timeout: 60 * time.Second,
+	}
+	resp, err := client.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("下载 manifest 失败: %w", err)
 	}

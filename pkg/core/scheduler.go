@@ -50,6 +50,18 @@ func mergeRanges(tasks []GlobalChunkTask, gapTolerance uint32) []ChunkRange {
 		return nil
 	}
 
+	// 过滤掉大小为 0 的块，防止 uint32 下溢
+	validTasks := make([]GlobalChunkTask, 0, len(tasks))
+	for _, t := range tasks {
+		if t.CompressedSize > 0 {
+			validTasks = append(validTasks, t)
+		}
+	}
+	if len(validTasks) == 0 {
+		return nil
+	}
+	tasks = validTasks
+
 	ranges := make([]ChunkRange, 0, len(tasks))
 
 	current := ChunkRange{

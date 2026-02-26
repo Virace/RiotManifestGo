@@ -46,7 +46,7 @@ func main() {
 	showVersion := flag.Bool("version", false, "显示程序版本信息并退出")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "RiotManifestGo CLI (v%s, commit %s) — Riot 游戏资源清单解析与下载\n\n", version, commit)
+		fmt.Fprintf(os.Stderr, "RiotManifestGo CLI (%s, commit %s) — Riot 游戏资源清单解析与下载\n\n", version, commit)
 		fmt.Fprintf(os.Stderr, "用法:\n")
 		fmt.Fprintf(os.Stderr, "  manifest-cli <manifest文件或URL> [选项]\n\n")
 		fmt.Fprintf(os.Stderr, "示例:\n")

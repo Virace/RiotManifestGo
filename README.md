@@ -27,8 +27,11 @@ go build -o manifest-cli ./cmd/manifest-cli/
 # 远程 manifest
 ./manifest-cli https://lol.secure.dyn.riotcdn.net/channels/public/releases/XXXXX.manifest -list
 
-# 筛选 Aatrox 的 de_DE 文件
-./manifest-cli game.manifest -list -p Aatrox -f de_DE
+# 筛选 Aatrox 的 de_DE 和 zh_CN 文件（OR 运算）
+./manifest-cli game.manifest -list -p Aatrox -f "de_DE|zh_CN"
+
+# 混合筛选：必须是 Windows 平台，且语言是 ja_JP 或 ko_KR
+./manifest-cli game.manifest -list -f "windows,ja_JP|ko_KR"
 ```
 
 ### 下载文件
@@ -48,7 +51,7 @@ go build -o manifest-cli ./cmd/manifest-cli/
 | `<manifest>` | manifest 文件路径或 URL（**必需**，位置参数） | - |
 | `-list` | 仅列出文件，不下载 | `false` |
 | `-p` | 路径筛选（子串或正则） | - |
-| `-f` | Flag 过滤，逗号分隔 | - |
+| `-f` | Flag 过滤，逗号代表与，管道符`\|`代表或（如 `de_DE,windows` 或 `ja_JP\|ko_KR`） | - |
 | `-o` | 输出目录 | `./output` |
 | `-u` | CDN Bundle 基础 URL | LoL CDN |
 | `-w` | 并发 Worker 数 | `16` |

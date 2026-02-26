@@ -26,6 +26,11 @@ import (
 
 const defaultCDNURL = "https://lol.dyn.riotcdn.net/channels/public/bundles"
 
+var (
+	version = "dev"
+	commit  = "none"
+)
+
 func main() {
 	outputDir := flag.String("o", "./output", "文件输出目录")
 	cdnURL := flag.String("u", defaultCDNURL, "CDN Bundle 基础 URL")
@@ -38,9 +43,10 @@ func main() {
 	maxRetries := flag.Int("retry", 3, "单个 Bundle 下载失败最大重试次数")
 	silent := flag.Bool("s", false, "静默模式，仅输出错误")
 	verbose := flag.Int("v", 0, "详细输出等级（0=默认进度条, 1=基础滚屏, 2=详细, 3=调试）")
+	showVersion := flag.Bool("version", false, "显示程序版本信息并退出")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "RiotManifestGo CLI — Riot 游戏资源清单解析与下载\n\n")
+		fmt.Fprintf(os.Stderr, "RiotManifestGo CLI (v%s, commit %s) — Riot 游戏资源清单解析与下载\n\n", version, commit)
 		fmt.Fprintf(os.Stderr, "用法:\n")
 		fmt.Fprintf(os.Stderr, "  manifest-cli <manifest文件或URL> [选项]\n\n")
 		fmt.Fprintf(os.Stderr, "示例:\n")
@@ -54,6 +60,11 @@ func main() {
 	manifestSource, remaining := extractManifestArg(os.Args[1:])
 	os.Args = append([]string{os.Args[0]}, remaining...)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("RiotManifestGo version %s, commit %s\n", version, commit)
+		os.Exit(0)
+	}
 
 	if manifestSource == "" {
 		flag.Usage()

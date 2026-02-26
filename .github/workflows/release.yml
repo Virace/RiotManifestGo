@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+        # UPX on Windows ARM64 or Darwin ARM64 usually has spotty support but we compile it anyway.
+        # We can exclude windows arm64 as we usually don't need it.
+        exclude:
+          - goos: windows
+            goarch: arm64
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          
+      - name: Install UPX
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
+        
+      - name: Build Binary
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $commit = "${{ github.sha }}".Substring(0, 7)
+          .\scripts\build.ps1 -Version $version -Commit $commit -Os ${{ matrix.goos }} -Arch ${{ matrix.goarch }}
+          
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

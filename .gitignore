@@ -39,3 +39,5 @@ go.work.sum
 
 # spec doc (internal only)
 RIOT_MANIFEST_GO_REWRITE_SPEC.md
+
+build/

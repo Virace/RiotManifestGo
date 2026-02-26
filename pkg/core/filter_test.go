@@ -92,6 +92,32 @@ func TestFilter_FlagsAND(t *testing.T) {
 	}
 }
 
+// TestFilter_FlagsOR 验证单组 Flag 的 OR 逻辑。
+func TestFilter_FlagsOR(t *testing.T) {
+	// zh_CN 或者 en_US 的文件
+	got := Filter(testFiles, FilterOption{Flags: []string{"zh_CN|en_US"}})
+	// 期望：Aatrox.zh_CN, Ahri.zh_CN, Assets/Sounds/en_US, Aatrox.common (共 4 个)
+	if len(got) != 4 {
+		t.Errorf("Flags=[zh_CN|en_US] 返回 %d 个，期望 4 个", len(got))
+		for _, f := range got {
+			t.Logf("  - %s flags=%v", f.Path, f.Flags)
+		}
+	}
+}
+
+// TestFilter_FlagsMixed 验证 AND 与 OR 的混合逻辑。
+func TestFilter_FlagsMixed(t *testing.T) {
+	// de_DE 必须存在，且 zh_CN 或 en_US 必须存在一项
+	got := Filter(testFiles, FilterOption{Flags: []string{"de_DE", "zh_CN|en_US"}})
+	// 期望：只有 Aatrox.common 满足
+	if len(got) != 1 {
+		t.Errorf("Flags=[de_DE, zh_CN|en_US] 返回 %d 个，期望 1 个", len(got))
+		for _, f := range got {
+			t.Logf("  - %s flags=%v", f.Path, f.Flags)
+		}
+	}
+}
+
 // TestFilter_PatternAndFlags 验证 Pattern + Flags 的 AND 组合。
 func TestFilter_PatternAndFlags(t *testing.T) {
 	// Aatrox 路径 AND de_DE flag

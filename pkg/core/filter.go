@@ -31,9 +31,10 @@ type FilterOption struct {
 	//   - 空字符串表示不过滤路径
 	Pattern string
 
-	// Flags 白名单：FileEntry.Flags 必须包含 Flags 中的全部元素（ALL-OF 语义）。
+	// Flags 白名单：支持逗号分隔的 AND 逻辑与管道符分隔的 OR 逻辑。
 	//
-	// 例如 Flags = []string{"de_DE"} 表示文件必须属于 de_DE 区域。
+	// 例如 Flags = []string{"de_DE", "ja_JP|ko_KR"}
+	// 表示文件必须满足属于 de_DE 区域（AND），且必须属于 ja_JP 或 ko_KR 区域（OR）。
 	// 空切片表示不过滤 Flags。
 	Flags []string
 }
@@ -52,8 +53,8 @@ type compiledFilter struct {
 	re *regexp.Regexp
 	// substring 当 Pattern 是子串时非空（已转为小写）
 	substring string
-	// flags 所有必须包含的 flag（已转为小写，用于大小写不敏感比较）
-	flags []string
+	// flags 所有必须包含的 flag 条件组（已转为小写）。文件需满足所有组（AND），每组内满足任一（OR）。
+	flags [][]string
 	// hasPattern 是否有路径过滤条件
 	hasPattern bool
 }
@@ -77,9 +78,14 @@ func (opt FilterOption) compile() (compiledFilter, error) {
 		}
 	}
 
-	cf.flags = make([]string, len(opt.Flags))
+	cf.flags = make([][]string, len(opt.Flags))
 	for i, f := range opt.Flags {
-		cf.flags[i] = strings.ToLower(f)
+		parts := strings.Split(f, "|")
+		group := make([]string, len(parts))
+		for j, p := range parts {
+			group[j] = strings.ToLower(p)
+		}
+		cf.flags[i] = group
 	}
 
 	return cf, nil
@@ -96,7 +102,7 @@ func (cf *compiledFilter) matchPath(path string) bool {
 	return strings.Contains(strings.ToLower(path), cf.substring)
 }
 
-// matchFlags 检测 entry.Flags 是否包含所有必须的 flag（ALL-OF 语义）。
+// matchFlags 检测 entry.Flags 是否满足所有 flag 条件组的要求。
 func (cf *compiledFilter) matchFlags(entryFlags []string) bool {
 	if len(cf.flags) == 0 {
 		return true
@@ -108,8 +114,15 @@ func (cf *compiledFilter) matchFlags(entryFlags []string) bool {
 		flagSet[strings.ToLower(f)] = struct{}{}
 	}
 
-	for _, required := range cf.flags {
-		if _, ok := flagSet[required]; !ok {
+	for _, reqGroup := range cf.flags {
+		groupMatched := false
+		for _, required := range reqGroup {
+			if _, ok := flagSet[required]; ok {
+				groupMatched = true
+				break
+			}
+		}
+		if !groupMatched {
 			return false
 		}
 	}

@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: Build & Release
+    name: Build Binaries
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -41,9 +41,29 @@ jobs:
           $commit = "${{ github.sha }}".Substring(0, 7)
           .\scripts\build.ps1 -Version $version -Commit $commit -Os ${{ matrix.goos }} -Arch ${{ matrix.goarch }}
           
-      - name: Upload Release Asset
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: build/*
+          retention-days: 1
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          files: build/*
+          name: Release ${{ github.ref_name }}
+          body: "Auto-generated release for RiotManifestGo ${{ github.ref_name }}"
+          files: artifacts/*
           fail_on_unmatched_files: true
-          generate_release_notes: true

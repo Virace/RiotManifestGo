@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -184,7 +183,10 @@ func (d *Downloader) preallocateFiles(ctx context.Context, files []rman.FileEntr
 		if f.FileSize == 0 {
 			continue
 		}
-		fullPath := filepath.Join(d.config.OutputDir, filepath.FromSlash(f.Path))
+		fullPath, err := outputPath(d.config.OutputDir, f.Path)
+		if err != nil {
+			return err
+		}
 		if err := d.filePool.PreallocateFile(fullPath, int64(f.FileSize)); err != nil {
 			return err
 		}
@@ -275,6 +277,11 @@ func (d *Downloader) processBundle(ctx context.Context, job BundleJob) error {
 		return fmt.Errorf("下载 Bundle %s 失败: %w", job.BundleFilename, err)
 	}
 
+	if len(rangeDatas) != len(job.Ranges) {
+		return fmt.Errorf("Bundle %s 返回 Range 数不匹配: got=%d want=%d",
+			job.BundleFilename, len(rangeDatas), len(job.Ranges))
+	}
+
 	for i, rangeData := range rangeDatas {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -289,6 +296,10 @@ func (d *Downloader) processBundle(ctx context.Context, job BundleJob) error {
 			}
 
 			// 使用绝对偏移（兼容 Gap Tolerance）
+			if task.BundleOffset < rangeStart {
+				return fmt.Errorf("Chunk %016X 偏移 %d 小于 Range 起点 %d",
+					task.Targets[0].ChunkID, task.BundleOffset, rangeStart)
+			}
 			chunkOffsetInRange := int(task.BundleOffset - rangeStart)
 			compEnd := chunkOffsetInRange + int(task.CompressedSize)
 			if compEnd > len(rangeData) {
@@ -310,7 +321,10 @@ func (d *Downloader) processBundle(ctx context.Context, job BundleJob) error {
 			}
 
 			for _, target := range task.Targets {
-				fullPath := filepath.Join(d.config.OutputDir, filepath.FromSlash(target.FilePath))
+				fullPath, pathErr := outputPath(d.config.OutputDir, target.FilePath)
+				if pathErr != nil {
+					return pathErr
+				}
 				if _, writeErr := d.filePool.WriteAt(fullPath, decompressed, target.FileOffset); writeErr != nil {
 					return fmt.Errorf("写入文件 %s 偏移 %d 失败: %w",
 						fullPath, target.FileOffset, writeErr)

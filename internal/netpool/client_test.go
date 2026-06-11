@@ -184,6 +184,28 @@ func TestFetchRanges_MultiRange(t *testing.T) {
 	}
 }
 
+// TestFetchRangesRejectsSinglePartForMultiRange verifies that a malformed 206
+// response cannot silently collapse multiple requested ranges into one body.
+func TestFetchRangesRejectsSinglePartForMultiRange(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte("not multipart"))
+	}))
+	defer srv.Close()
+
+	client := NewBundleClient(srv.URL, 2)
+	defer client.Close()
+
+	_, err := client.FetchRanges(context.Background(), "bad.bundle", []ByteRange{
+		{Start: 0, End: 3},
+		{Start: 10, End: 13},
+	})
+	if err == nil {
+		t.Fatal("multi-range single-part 206 response should return error")
+	}
+}
+
 // TestFetchRanges_FullBody200 验证 CDN 返回 200（忽略 Range）时的处理。
 func TestFetchRanges_FullBody200(t *testing.T) {
 	// 模拟 CDN 始终返回 200 + 完整文件体

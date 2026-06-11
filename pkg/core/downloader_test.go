@@ -488,3 +488,53 @@ func TestDownload_Events(t *testing.T) {
 		}
 	}
 }
+
+func TestDownloadRejectsPathTraversal(t *testing.T) {
+	config, dir := makeTestConfig(t)
+	config.MaxRetries = 0
+
+	const bundleID uint64 = 0xDD00000000000001
+	chunk := makeTestChunk(t, []byte("path traversal payload"), bundleID, 0)
+	file := makeTestFileEntry("../escape.bin", chunk)
+
+	mock := newMockFetcher()
+	setupMockResponse(t, mock, bundleID, chunk)
+
+	dl := NewDownloaderWithFetcher(config, mock)
+	err := dl.Download(context.Background(), []rman.FileEntry{file})
+	if err == nil {
+		t.Fatal("Download succeeded for path traversal manifest path, want error")
+	}
+
+	if _, statErr := os.Stat(filepath.Join(filepath.Dir(dir), "escape.bin")); !os.IsNotExist(statErr) {
+		t.Fatalf("path traversal created file outside output dir: %v", statErr)
+	}
+}
+
+func TestDownloadRejectsMismatchedRangeResponseCount(t *testing.T) {
+	config, _ := makeTestConfig(t)
+	config.MaxRetries = 0
+
+	const bundleID uint64 = 0xEE00000000000001
+	chunk0 := makeTestChunk(t, []byte("first range data"), bundleID, 0)
+	chunk1 := makeTestChunk(t, []byte("second range data"), bundleID, chunk0.compSize+100)
+	file := makeTestFileEntry("safe/output.bin", chunk0, chunk1)
+
+	mock := newMockFetcher()
+	mock.responses[BundleFilename(bundleID)] = []rangeResp{{data: chunk0.compressed}}
+
+	dl := NewDownloaderWithFetcher(config, mock)
+	events := dl.Events()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range events {
+		}
+	}()
+
+	err := dl.Download(context.Background(), []rman.FileEntry{file})
+	<-done
+	if err == nil {
+		t.Fatal("Download succeeded with mismatched range response count, want error")
+	}
+}

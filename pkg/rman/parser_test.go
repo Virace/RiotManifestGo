@@ -303,6 +303,20 @@ func TestParseManifest_RealFile(t *testing.T) {
 	t.Logf("✓ 涉及不同 Bundle 数: %d", len(uniqueBundles))
 }
 
+func TestParseBodyMalformedFlatBuffersReturnsError(t *testing.T) {
+	body := []byte{0x04, 0x00, 0x00, 0x00, 0xff}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("parseBody should return error instead of panic, got panic: %v", r)
+		}
+	}()
+
+	if _, err := parseBody(body); err == nil {
+		t.Fatal("parseBody should reject malformed FlatBuffers body")
+	}
+}
+
 // ---- FlatBuffers 测试辅助构造器 ----
 
 // buildMinimalFlatBuffersBody 构造一个最小化的 FlatBuffers body，

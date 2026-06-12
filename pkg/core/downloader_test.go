@@ -488,3 +488,136 @@ func TestDownload_Events(t *testing.T) {
 		}
 	}
 }
+
+func TestDownloadRejectsPathTraversal(t *testing.T) {
+	config, dir := makeTestConfig(t)
+	config.MaxRetries = -1
+
+	const bundleID uint64 = 0xDD00000000000001
+	chunk := makeTestChunk(t, []byte("path traversal payload"), bundleID, 0)
+	file := makeTestFileEntry("../escape.bin", chunk)
+
+	mock := newMockFetcher()
+	setupMockResponse(t, mock, bundleID, chunk)
+
+	dl := NewDownloaderWithFetcher(config, mock)
+	err := dl.Download(context.Background(), []rman.FileEntry{file})
+	if err == nil {
+		t.Fatal("Download succeeded for path traversal manifest path, want error")
+	}
+
+	if _, statErr := os.Stat(filepath.Join(filepath.Dir(dir), "escape.bin")); !os.IsNotExist(statErr) {
+		t.Fatalf("path traversal created file outside output dir: %v", statErr)
+	}
+}
+
+func TestDownloadRejectsMismatchedRangeResponseCount(t *testing.T) {
+	config, _ := makeTestConfig(t)
+	config.MaxRetries = -1
+
+	const bundleID uint64 = 0xEE00000000000001
+	chunk0 := makeTestChunk(t, []byte("first range data"), bundleID, 0)
+	chunk1 := makeTestChunk(t, []byte("second range data"), bundleID, chunk0.compSize+100)
+	file := makeTestFileEntry("safe/output.bin", chunk0, chunk1)
+
+	mock := newMockFetcher()
+	mock.responses[BundleFilename(bundleID)] = []rangeResp{{data: chunk0.compressed}}
+
+	dl := NewDownloaderWithFetcher(config, mock)
+	events := dl.Events()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range events {
+		}
+	}()
+
+	err := dl.Download(context.Background(), []rman.FileEntry{file})
+	<-done
+	if err == nil {
+		t.Fatal("Download succeeded with mismatched range response count, want error")
+	}
+}
+
+func TestDownloadDoesNotBlockWithoutEventConsumer(t *testing.T) {
+	config, dir := makeTestConfig(t)
+	config.Workers = 1
+
+	const bundleID uint64 = 0xAB00000000000001
+	chunk := makeTestChunk(t, []byte("event consumer optional payload"), bundleID, 0)
+
+	files := make([]rman.FileEntry, 0, 8)
+	for i := 0; i < 8; i++ {
+		files = append(files, makeTestFileEntry(fmt.Sprintf("noevents/file_%02d.bin", i), chunk))
+	}
+
+	mock := newMockFetcher()
+	setupMockResponse(t, mock, bundleID, chunk)
+
+	dl := NewDownloaderWithFetcher(config, mock)
+	done := make(chan error, 1)
+	go func() {
+		done <- dl.Download(context.Background(), files)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Download without event consumer returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Download blocked when Events was not consumed")
+	}
+
+	content, err := os.ReadFile(filepath.Join(dir, "noevents", "file_00.bin"))
+	if err != nil {
+		t.Fatalf("读取输出文件失败: %v", err)
+	}
+	if !bytes.Equal(content, chunk.raw) {
+		t.Fatal("未消费事件时写盘内容不正确")
+	}
+}
+
+func TestDownloadDefaultMaxRetriesUsesThreeRetries(t *testing.T) {
+	config, dir := makeTestConfig(t)
+	config.MaxRetries = 0
+
+	const bundleID uint64 = 0xAC00000000000001
+	chunkData := []byte("zero value retry default data")
+	chunk := makeTestChunk(t, chunkData, bundleID, 0)
+	file := makeTestFileEntry("retry/default.bin", chunk)
+
+	mock := newMockFetcher()
+	mock.failUntil = 2
+	setupMockResponse(t, mock, bundleID, chunk)
+
+	dl := NewDownloaderWithFetcher(config, mock)
+	events := dl.Events()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range events {
+		}
+	}()
+
+	err := dl.Download(context.Background(), []rman.FileEntry{file})
+	<-done
+	if err != nil {
+		t.Fatalf("zero-value MaxRetries should use default retries, got error: %v", err)
+	}
+
+	mock.mu.Lock()
+	callCount := mock.callCount
+	mock.mu.Unlock()
+	if callCount != 3 {
+		t.Fatalf("FetchRanges call count = %d, want 3", callCount)
+	}
+
+	content, err := os.ReadFile(filepath.Join(dir, "retry", "default.bin"))
+	if err != nil {
+		t.Fatalf("读取输出文件失败: %v", err)
+	}
+	if !bytes.Equal(content, chunkData) {
+		t.Fatal("默认重试后的文件内容不匹配")
+	}
+}

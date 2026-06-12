@@ -84,13 +84,10 @@ func main() {
 	// 2. 过滤
 	files := manifest.Files
 	if *pattern != "" || *flags != "" {
-		var opts []core.FilterOption
-		opt := core.FilterOption{Pattern: *pattern}
-		if *flags != "" {
-			opt.Flags = strings.Split(*flags, ",")
+		files, err = applyFilters(files, *pattern, *flags)
+		if err != nil {
+			log.Fatalf("❌ 筛选条件无效: %v", err)
 		}
-		opts = append(opts, opt)
-		files = core.Filter(files, opts...)
 		printer.info("🔍 筛选结果: %d 个文件匹配\n", len(files))
 	}
 
@@ -361,6 +358,14 @@ func loadManifestFromURL(url string) (*rman.Manifest, error) {
 	}
 
 	return rman.Parse(bytes.NewReader(data))
+}
+
+func applyFilters(files []rman.FileEntry, pattern, flags string) ([]rman.FileEntry, error) {
+	opt := core.FilterOption{Pattern: pattern}
+	if flags != "" {
+		opt.Flags = strings.Split(flags, ",")
+	}
+	return core.FilterWithError(files, opt)
 }
 
 // ---- 日志保存 ----

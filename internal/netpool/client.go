@@ -152,6 +152,10 @@ func (c *BundleClient) parsePartialContent(resp *http.Response, expectedCount in
 		return parseMultipartResponse(resp.Body, params["boundary"], expectedCount)
 	}
 
+	if expectedCount != 1 {
+		return nil, fmt.Errorf("单段 Range 响应数量不匹配: 收到=1, 期望=%d", expectedCount)
+	}
+
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("读取单段响应失败: %w", err)

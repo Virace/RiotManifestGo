@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,7 +51,7 @@ type DownloadConfig struct {
 	// GapTolerance Range 合并间隙容忍阈值（默认 32KB）
 	GapTolerance uint32
 
-	// MaxRetries 单个 BundleJob 失败时的最大重试次数（默认 3）
+	// MaxRetries 单个 BundleJob 失败时的最大重试次数（默认 3；负数表示不重试）
 	MaxRetries int
 }
 
@@ -92,7 +91,7 @@ func newDownloader(config DownloadConfig, fetcher BundleFetcher) *Downloader {
 	if config.MaxRangesPerReq <= 0 {
 		config.MaxRangesPerReq = 30
 	}
-	if config.MaxRetries < 0 {
+	if config.MaxRetries == 0 {
 		config.MaxRetries = 3
 	}
 
@@ -106,8 +105,16 @@ func newDownloader(config DownloadConfig, fetcher BundleFetcher) *Downloader {
 }
 
 // Events 返回只读事件 channel，在 Download() 完成后关闭。
+// 事件用于进度展示；若消费者跟不上或未消费，下载流程会丢弃事件而不是阻塞。
 func (d *Downloader) Events() <-chan DownloadEvent {
 	return d.events
+}
+
+func (d *Downloader) emit(event DownloadEvent) {
+	select {
+	case d.events <- event:
+	default:
+	}
 }
 
 // Download 执行完整的下载流程。
@@ -162,13 +169,13 @@ func (d *Downloader) Download(ctx context.Context, files []rman.FileEntry) error
 	wg.Wait()
 
 	// 5. 完成事件
-	d.events <- EventComplete{
+	d.emit(EventComplete{
 		TotalFiles:    len(files),
 		TotalChunks:   totalChunks,
 		TotalBytes:    totalBytes,
 		FailedBundles: int(failedBundles.Load()),
 		Elapsed:       time.Since(startTime),
-	}
+	})
 
 	if failedBundles.Load() > 0 {
 		return fmt.Errorf("下载完成但有 %d 个 Bundle 失败", failedBundles.Load())
@@ -184,11 +191,14 @@ func (d *Downloader) preallocateFiles(ctx context.Context, files []rman.FileEntr
 		if f.FileSize == 0 {
 			continue
 		}
-		fullPath := filepath.Join(d.config.OutputDir, filepath.FromSlash(f.Path))
+		fullPath, err := outputPath(d.config.OutputDir, f.Path)
+		if err != nil {
+			return err
+		}
 		if err := d.filePool.PreallocateFile(fullPath, int64(f.FileSize)); err != nil {
 			return err
 		}
-		d.events <- EventFilePreallocated{Path: fullPath, Size: int64(f.FileSize)}
+		d.emit(EventFilePreallocated{Path: fullPath, Size: int64(f.FileSize)})
 	}
 	return nil
 }
@@ -205,11 +215,11 @@ func (d *Downloader) worker(
 		}
 		if err := d.processBundleWithRetry(ctx, job); err != nil {
 			failedBundles.Add(1)
-			d.events <- EventError{
+			d.emit(EventError{
 				BundleID:       job.BundleID,
 				BundleFilename: job.BundleFilename,
 				Err:            err,
-			}
+			})
 		}
 	}
 }
@@ -221,15 +231,19 @@ func (d *Downloader) worker(
 // 不做断点续传：manifest 无文件级校验信息，续传容易导致文件错误。
 func (d *Downloader) processBundleWithRetry(ctx context.Context, job BundleJob) error {
 	var lastErr error
-	for attempt := 0; attempt <= d.config.MaxRetries; attempt++ {
+	maxRetries := d.config.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
-			d.events <- EventRetry{
+			d.emit(EventRetry{
 				BundleID:       job.BundleID,
 				BundleFilename: job.BundleFilename,
 				Attempt:        attempt,
-				MaxRetries:     d.config.MaxRetries,
+				MaxRetries:     maxRetries,
 				Err:            lastErr,
-			}
+			})
 			// 指数退避
 			select {
 			case <-time.After(time.Duration(attempt) * time.Second):
@@ -245,7 +259,7 @@ func (d *Downloader) processBundleWithRetry(ctx context.Context, job BundleJob) 
 			return ctx.Err()
 		}
 	}
-	return fmt.Errorf("经 %d 次重试后仍失败: %w", d.config.MaxRetries, lastErr)
+	return fmt.Errorf("经 %d 次重试后仍失败: %w", maxRetries, lastErr)
 }
 
 // processBundle 处理单个 BundleJob 的完整下载→解压→写盘流程。
@@ -258,12 +272,12 @@ func (d *Downloader) processBundle(ctx context.Context, job BundleJob) error {
 		chunkCount += len(r.Chunks)
 	}
 
-	d.events <- EventBundleStart{
+	d.emit(EventBundleStart{
 		BundleID:       job.BundleID,
 		BundleFilename: job.BundleFilename,
 		RangeCount:     len(job.Ranges),
 		ChunkCount:     chunkCount,
-	}
+	})
 
 	byteRanges := make([]ByteRange, len(job.Ranges))
 	for i, r := range job.Ranges {
@@ -273,6 +287,11 @@ func (d *Downloader) processBundle(ctx context.Context, job BundleJob) error {
 	rangeDatas, err := d.client.FetchRanges(ctx, job.BundleFilename, byteRanges)
 	if err != nil {
 		return fmt.Errorf("下载 Bundle %s 失败: %w", job.BundleFilename, err)
+	}
+
+	if len(rangeDatas) != len(job.Ranges) {
+		return fmt.Errorf("Bundle %s 返回 Range 数不匹配: got=%d want=%d",
+			job.BundleFilename, len(rangeDatas), len(job.Ranges))
 	}
 
 	for i, rangeData := range rangeDatas {
@@ -289,6 +308,10 @@ func (d *Downloader) processBundle(ctx context.Context, job BundleJob) error {
 			}
 
 			// 使用绝对偏移（兼容 Gap Tolerance）
+			if task.BundleOffset < rangeStart {
+				return fmt.Errorf("Chunk %016X 偏移 %d 小于 Range 起点 %d",
+					task.Targets[0].ChunkID, task.BundleOffset, rangeStart)
+			}
 			chunkOffsetInRange := int(task.BundleOffset - rangeStart)
 			compEnd := chunkOffsetInRange + int(task.CompressedSize)
 			if compEnd > len(rangeData) {
@@ -310,7 +333,10 @@ func (d *Downloader) processBundle(ctx context.Context, job BundleJob) error {
 			}
 
 			for _, target := range task.Targets {
-				fullPath := filepath.Join(d.config.OutputDir, filepath.FromSlash(target.FilePath))
+				fullPath, pathErr := outputPath(d.config.OutputDir, target.FilePath)
+				if pathErr != nil {
+					return pathErr
+				}
 				if _, writeErr := d.filePool.WriteAt(fullPath, decompressed, target.FileOffset); writeErr != nil {
 					return fmt.Errorf("写入文件 %s 偏移 %d 失败: %w",
 						fullPath, target.FileOffset, writeErr)
@@ -320,15 +346,15 @@ func (d *Downloader) processBundle(ctx context.Context, job BundleJob) error {
 			d.bytesDownloaded.Add(int64(task.CompressedSize))
 			d.chunksDone.Add(1)
 
-			d.events <- EventChunkDone{
+			d.emit(EventChunkDone{
 				ChunkID:        chunkID,
 				BundleID:       job.BundleID,
 				CompressedSize: task.CompressedSize,
 				TargetCount:    len(task.Targets),
-			}
+			})
 		}
 	}
 
-	d.events <- EventBundleDone{BundleID: job.BundleID}
+	d.emit(EventBundleDone{BundleID: job.BundleID})
 	return nil
 }

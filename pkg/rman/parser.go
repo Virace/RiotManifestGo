@@ -130,9 +130,23 @@ func parseHeader(data []byte) (*Header, error) {
 }
 
 // parseBody 解析 ZSTD 解压后的 FlatBuffers Body。
-func parseBody(body []byte) ([]FileEntry, error) {
+func parseBody(body []byte) (files []FileEntry, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			files = nil
+			err = fmt.Errorf("FlatBuffers Body 格式无效: %v", r)
+		}
+	}()
+
+	if len(body) < 4 {
+		return nil, fmt.Errorf("FlatBuffers Body 过短：%d 字节", len(body))
+	}
+
 	// FlatBuffers 根对象偏移
 	rootOffset := fbRootOffset(body)
+	if rootOffset+4 > uint32(len(body)) {
+		return nil, fmt.Errorf("FlatBuffers root offset 越界: offset=%d len=%d", rootOffset, len(body))
+	}
 
 	// 解析 Parameters 列表（field index 5）
 	// 需要先解析 parameters，因为 FileEntry 通过 param_index 引用哈希类型
@@ -164,7 +178,7 @@ func parseBody(body []byte) ([]FileEntry, error) {
 	}
 
 	// 解析 FileEntry 列表（field index 2）
-	files, err := parseFileEntries(body, rootOffset, chunkMap, dirMap, langMap, params)
+	files, err = parseFileEntries(body, rootOffset, chunkMap, dirMap, langMap, params)
 	if err != nil {
 		return nil, fmt.Errorf("解析 FileEntries 失败: %w", err)
 	}

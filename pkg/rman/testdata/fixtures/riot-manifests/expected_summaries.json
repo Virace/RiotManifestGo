@@ -1,0 +1,37 @@
+{
+  "fixed-old-windows-lol-game-client": {
+    "manifest_id": "037EC59D5BD7C5D3",
+    "file_count": 3416,
+    "total_chunk_refs": 474597,
+    "unique_bundle_count": 4944,
+    "required_files": [
+      {
+        "path": "DATA/FINAL/Bootstrap.wad.client",
+        "min_chunks": 1
+      },
+      {
+        "path": "DATA/FINAL/Champions/Aatrox.de_DE.wad.client",
+        "flag": "de_DE",
+        "min_chunks": 1
+      }
+    ]
+  },
+  "fixed-middle-windows-lol-game-client": {
+    "manifest_id": "FB988FB8D46FDD43",
+    "file_count": 3626,
+    "total_chunk_refs": 1011654,
+    "unique_bundle_count": 9036,
+    "required_files": [
+      {
+        "path": "DATA/FINAL/Bootstrap.windows.wad.client",
+        "flag": "windows",
+        "min_chunks": 1
+      },
+      {
+        "path": "DATA/FINAL/Champions/Aatrox.de_DE.wad.client",
+        "flag": "de_DE",
+        "min_chunks": 1
+      }
+    ]
+  }
+}

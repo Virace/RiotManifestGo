@@ -29,7 +29,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24.x'
+          go-version: '1.25.x'
           
       - name: Install UPX
         run: sudo apt-get update && sudo apt-get install -y upx-ucl
@@ -39,7 +39,7 @@ jobs:
         run: |
           $version = "${{ github.ref_name }}"
           $commit = "${{ github.sha }}".Substring(0, 7)
-          .\scripts\build.ps1 -Version $version -Commit $commit -Os ${{ matrix.goos }} -Arch ${{ matrix.goarch }}
+          ./scripts/build.ps1 -Version $version -Commit $commit -Os ${{ matrix.goos }} -Arch ${{ matrix.goarch }}
           
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -48,9 +48,44 @@ jobs:
           path: build/*
           retention-days: 1
 
+  smoke:
+    name: Release Smoke Test
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      - name: Run Unit and Component Tests
+        run: go test ./... -count=1
+
+      - name: Initialize Fixture Cache
+        shell: pwsh
+        run: ./scripts/init-fixtures.ps1
+
+      - name: Run Offline Fixture Tests
+        run: go test -tags=fixtures ./pkg/rman -count=1
+
+      - name: Download Linux AMD64 Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-linux-amd64
+          path: build
+
+      - name: Run Live Download Smoke
+        shell: pwsh
+        run: |
+          chmod +x ./build/manifest-cli-linux-amd64
+          ./scripts/release-smoke.ps1 -BinaryPath ./build/manifest-cli-linux-amd64
+
   release:
     name: Create Release
-    needs: build
+    needs: [build, smoke]
     runs-on: ubuntu-latest
     steps:
       - name: Download All Artifacts

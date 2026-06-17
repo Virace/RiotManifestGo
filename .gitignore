@@ -34,6 +34,10 @@ go.work.sum
 # dev temp
 .temp/
 
+# local fixture cache
+pkg/rman/testdata/.cache/
+pkg/rman/testdata/**/*.manifest
+
 # ai
 .ai_memory/
 

@@ -1,0 +1,42 @@
+{
+  "source_repository": "https://github.com/Morilli/riot-manifests",
+  "source_ref": "master",
+  "default_region": "LoL/OC1",
+  "cache_dir": "pkg/rman/testdata/.cache/riot-manifests",
+  "fixtures": [
+    {
+      "name": "fixed-old-windows-lol-game-client",
+      "slot": "fixed-old",
+      "platform": "windows",
+      "product": "lol-game-client",
+      "version": "10.9.3185929",
+      "upstream_index_path": "LoL/OC1/windows/lol-game-client/10.9.3185929.txt",
+      "manifest_id": "037EC59D5BD7C5D3",
+      "cdn_url": "https://lol.secure.dyn.riotcdn.net/channels/public/releases/037EC59D5BD7C5D3.manifest",
+      "size": 9521609,
+      "sha256": "0530206BA86366BBC464112D26A8102E4DCE295CB2854D2E4B73CEFAB0BEC1AE",
+      "selection_reason": "old fixed parser coverage sample"
+    },
+    {
+      "name": "fixed-middle-windows-lol-game-client",
+      "slot": "fixed-middle",
+      "platform": "windows",
+      "product": "lol-game-client",
+      "version": "13.12.5142556",
+      "upstream_index_path": "LoL/OC1/windows/lol-game-client/13.12.5142556.txt",
+      "manifest_id": "FB988FB8D46FDD43",
+      "cdn_url": "https://lol.secure.dyn.riotcdn.net/channels/public/releases/FB988FB8D46FDD43.manifest",
+      "size": 19093999,
+      "sha256": "F530C486CC351EEA8032A54B0FD6992E0371F55CD6A1D64FC394ADB2DCA1A5D0",
+      "selection_reason": "middle fixed parser coverage sample"
+    },
+    {
+      "name": "latest-release-check-windows-lol-game-client",
+      "slot": "latest-release-check",
+      "platform": "windows",
+      "product": "lol-game-client",
+      "latest_selector": "LoL/OC1/windows/lol-game-client/*.txt",
+      "selection_reason": "release-time latest parser compatibility check"
+    }
+  ]
+}

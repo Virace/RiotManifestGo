@@ -85,6 +85,33 @@ func (p *FilePool) PreallocateFile(path string, size int64) error {
 	return nil
 }
 
+// ClosePath 关闭并从池中移出指定路径的句柄。
+//
+// Windows 下无法对持有打开句柄的文件执行 rename 覆盖，因此在对某路径调用
+// CommitStaging / DiscardStaging 之前，必须先对该路径调用 ClosePath 确保
+// 句柄已释放。路径不在池中时视为已关闭，直接返回 nil。
+func (p *FilePool) ClosePath(path string) error {
+	p.mu.Lock()
+	elem, ok := p.handles[path]
+	if !ok {
+		p.mu.Unlock()
+		return nil
+	}
+	p.lru.Remove(elem)
+	delete(p.handles, path)
+	entry := elem.Value.(*poolEntry)
+	entry.evicted = true
+	closeNow := entry.refs == 0
+	p.mu.Unlock()
+
+	if closeNow {
+		if err := entry.file.Close(); err != nil {
+			return fmt.Errorf("关闭文件句柄失败 %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
 // Close 关闭池中所有打开的文件句柄。
 func (p *FilePool) Close() error {
 	p.mu.Lock()

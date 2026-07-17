@@ -75,10 +75,13 @@ func main() {
 
 	// 1. 解析 Manifest
 	printer.info("📄 解析 manifest: %s\n", manifestSource)
-	manifest, err := loadManifest(manifestSource)
+	// manifestRaw/manifestSource 保留原始字节与来源字符串，供后续编排任务
+	// （自动发现旧版本时调用 update.Archive.Save 存档）使用，本次改动不在此处消费。
+	manifest, manifestRaw, err := loadManifest(manifestSource)
 	if err != nil {
 		log.Fatalf("❌ 解析失败: %v", err)
 	}
+	_ = manifestRaw
 	printer.info("✅ ManifestID: %016X | 文件总数: %d\n\n", manifest.ManifestID, len(manifest.Files))
 
 	// 2. 过滤
@@ -331,33 +334,51 @@ func heartbeat(dl *downloadLog, stop <-chan struct{}) {
 
 // ---- 远程 Manifest 获取 ----
 
-func loadManifest(source string) (*rman.Manifest, error) {
+// loadManifest 解析 manifest，同时返回其原始字节，供调用方在需要时存档
+// （例如后续编排任务写入 update.Archive）。
+func loadManifest(source string) (*rman.Manifest, []byte, error) {
 	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
 		return loadManifestFromURL(source)
 	}
-	return rman.ParseFile(source)
+	return loadManifestFromFile(source)
 }
 
-func loadManifestFromURL(url string) (*rman.Manifest, error) {
+func loadManifestFromFile(path string) (*rman.Manifest, []byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("读取 manifest 文件失败: %w", err)
+	}
+	manifest, err := rman.Parse(bytes.NewReader(data))
+	if err != nil {
+		return nil, nil, err
+	}
+	return manifest, data, nil
+}
+
+func loadManifestFromURL(url string) (*rman.Manifest, []byte, error) {
 	client := &http.Client{
 		Timeout: 60 * time.Second,
 	}
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("下载 manifest 失败: %w", err)
+		return nil, nil, fmt.Errorf("下载 manifest 失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("下载 manifest 失败: HTTP %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("下载 manifest 失败: HTTP %d", resp.StatusCode)
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("读取 manifest 数据失败: %w", err)
+		return nil, nil, fmt.Errorf("读取 manifest 数据失败: %w", err)
 	}
 
-	return rman.Parse(bytes.NewReader(data))
+	manifest, err := rman.Parse(bytes.NewReader(data))
+	if err != nil {
+		return nil, nil, err
+	}
+	return manifest, data, nil
 }
 
 func applyFilters(files []rman.FileEntry, pattern, flags string) ([]rman.FileEntry, error) {

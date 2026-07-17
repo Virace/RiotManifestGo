@@ -3,6 +3,7 @@ package fswriter
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -83,9 +84,11 @@ func TestDiscardStagingKeepsOriginal(t *testing.T) {
 	})
 }
 
-// TestClosePathThenRename 验证池中仍持有暂存文件打开句柄时直接 Commit 会失败，
-// 必须先调用 ClosePath 关闭句柄后 CommitStaging 才能成功；
-// 这固化了 Windows 下无法 rename 覆盖持有打开句柄文件的限制。
+// TestClosePathThenRename 验证池中持有暂存文件打开句柄时，必须先调用
+// ClosePath 关闭句柄，CommitStaging 才能成功——这是跨平台都要满足的核心行为。
+// 额外在 Windows 上验证：句柄未关闭时直接 Commit 会失败，固化 Windows 下
+// 无法 rename 覆盖持有打开句柄文件的限制；POSIX 的 rename(2) 允许源文件
+// 存在打开 fd，因此该失败断言不适用于 Linux/macOS。
 func TestClosePathThenRename(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "target.bin")
@@ -106,9 +109,13 @@ func TestClosePathThenRename(t *testing.T) {
 		t.Fatalf("WriteAt 失败: %v", err)
 	}
 
-	// 池中仍持有 staging 的打开句柄，此时直接 Commit 预期失败。
-	if err := CommitStaging(path); err == nil {
-		t.Fatalf("句柄仍打开时 CommitStaging 预期失败，但成功了")
+	// 池中仍持有 staging 的打开句柄时直接 Commit 预期失败——仅在 Windows 上
+	// 断言，因为 POSIX rename(2) 对有打开 fd 的源文件依然会成功，在 Linux/
+	// macOS 上调用会实际完成 rename，导致后续 ClosePath+Commit 流程失真。
+	if runtime.GOOS == "windows" {
+		if err := CommitStaging(path); err == nil {
+			t.Fatalf("句柄仍打开时 CommitStaging 预期失败，但成功了")
+		}
 	}
 
 	if err := pool.ClosePath(staging); err != nil {

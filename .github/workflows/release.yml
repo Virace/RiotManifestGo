@@ -88,6 +88,11 @@ jobs:
     needs: [build, smoke]
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download All Artifacts
         uses: actions/download-artifact@v4
         with:
@@ -95,10 +100,25 @@ jobs:
           pattern: binary-*
           merge-multiple: true
 
+      - name: Generate Release Notes
+        run: |
+          prev=$(git describe --tags --abbrev=0 "${{ github.ref_name }}^" 2>/dev/null || true)
+          {
+            echo "## 更新内容"
+            echo
+            if [ -n "$prev" ]; then
+              git log --no-merges --format='- %s (%h)' "$prev..${{ github.ref_name }}"
+              echo
+              echo "**完整变更**: [\`$prev...${{ github.ref_name }}\`](https://github.com/${{ github.repository }}/compare/$prev...${{ github.ref_name }})"
+            else
+              git log --no-merges --format='- %s (%h)' "${{ github.ref_name }}"
+            fi
+          } > release-notes.md
+
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          name: Release ${{ github.ref_name }}
-          body: "Auto-generated release for RiotManifestGo ${{ github.ref_name }}"
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
           files: artifacts/*
           fail_on_unmatched_files: true

@@ -88,6 +88,22 @@ func TestComputeHash_HKDF(t *testing.T) {
 	}
 }
 
+// TestValidateChunk_HashTypeNoneSkips 验证 HashTypeNone 时跳过哈希校验直接放行。
+// 契约与 PyManifest validate_chunk_hash 对齐（hash_type=0 → compute 返回 None → 不校验）：
+// 下载路径对无 params 条目的 chunk（实测 16.3 约 81%）不做哈希校验，
+// 完整性由 ZSTD 解压成功 + 解压大小精确匹配兜底。
+func TestValidateChunk_HashTypeNoneSkips(t *testing.T) {
+	data := []byte("chunk without params entry")
+	arbitraryID := uint64(0x1234567890ABCDEF) // 与任何算法结果都不匹配的任意 ID
+
+	if !ValidateChunk(data, arbitraryID, rman.HashTypeNone) {
+		t.Error("HashTypeNone 时 ValidateChunk 应跳过校验返回 true")
+	}
+	if err := ValidateChunkError(data, arbitraryID, rman.HashTypeNone); err != nil {
+		t.Errorf("HashTypeNone 时 ValidateChunkError 应返回 nil，got %v", err)
+	}
+}
+
 // TestValidateChunkError 验证 ValidateChunkError 返回详细错误信息。
 func TestValidateChunkError(t *testing.T) {
 	data := []byte("test")

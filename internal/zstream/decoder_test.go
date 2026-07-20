@@ -88,6 +88,39 @@ func TestDecoder_DecompressAndValidate_WrongSize(t *testing.T) {
 	}
 }
 
+// TestDecoder_DecompressAndValidate_HashTypeNone 验证 HashTypeNone 的 chunk
+// 解压 + 大小校验通过后即接受（跳过哈希校验，对齐 PyManifest 下载路径契约），
+// 但解压大小不匹配仍然报错。
+func TestDecoder_DecompressAndValidate_HashTypeNone(t *testing.T) {
+	original := []byte("chunk data without params entry")
+	compressed := compressTestData(t, original)
+
+	d := NewDecoder()
+
+	result, err := d.DecompressAndValidate(
+		compressed,
+		uint32(len(original)),
+		0xDEADBEEF, // 任意 ChunkID：HashTypeNone 下不参与校验
+		rman.HashTypeNone,
+	)
+	if err != nil {
+		t.Fatalf("HashTypeNone 时 DecompressAndValidate 应通过: %v", err)
+	}
+	if string(result) != string(original) {
+		t.Errorf("解压结果不匹配")
+	}
+
+	// 大小校验不因 HashTypeNone 而放松
+	if _, err := d.DecompressAndValidate(
+		compressed,
+		uint32(len(original)+1),
+		0xDEADBEEF,
+		rman.HashTypeNone,
+	); err == nil {
+		t.Fatal("HashTypeNone 下解压大小不匹配仍应返回 error")
+	}
+}
+
 // TestDecoder_ConcurrentSafe 验证 Decoder 的并发安全性（sync.Pool）。
 func TestDecoder_ConcurrentSafe(t *testing.T) {
 	d := NewDecoder()

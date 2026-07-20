@@ -39,9 +39,10 @@ function ConvertTo-NormalizedRelativePath {
         [string]$FullPath
     )
 
-    $baseUri = [Uri]($BasePath.TrimEnd("\", "/") + [IO.Path]::DirectorySeparatorChar)
-    $fullUri = [Uri]$FullPath
-    return $baseUri.MakeRelativeUri($fullUri).ToString()
+    # [Uri]::MakeRelativeUri is not usable here: POSIX absolute paths parse as
+    # relative URIs and the call throws on Linux runners.
+    $relative = [IO.Path]::GetRelativePath($BasePath, $FullPath)
+    return $relative -replace "\\", "/"
 }
 
 function Get-VersionParts {

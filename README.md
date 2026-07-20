@@ -2,7 +2,10 @@
 
 Riot 游戏资源清单（RMAN / `.manifest`）解析与下载工具的 Go 实现。
 
-> 致谢 [Morilli/ManifestDownloader](https://github.com/Morilli/ManifestDownloader)，本项目参考其 C 实现进行了 Go 语言重写。
+> **鸣谢**
+>
+> - [Morilli/ManifestDownloader](https://github.com/Morilli/ManifestDownloader) — 清单解析与下载参考其 C 实现进行 Go 语言重写
+> - [moonshadow565/rman](https://github.com/moonshadow565/rman) — update 增量更新逻辑参考其 RMAN 实现
 
 ## 功能
 

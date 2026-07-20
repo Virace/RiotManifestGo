@@ -66,9 +66,39 @@ type EventError struct {
 // EventComplete 在所有 BundleJob 处理完毕时发出。
 type EventComplete struct {
 	eventBase
-	TotalFiles    int
-	TotalChunks   int
-	TotalBytes    int64
+	TotalFiles  int
+	TotalChunks int
+	TotalBytes  int64
+	// FailedBundles 是关联到失败 BundleJob 的目标文件数（DownloadTasks 返回的
+	// failed 集合大小）：一个失败的 Job 可能覆盖多个文件，一个文件命中多个失败
+	// Job 时也只计一次，因此不等价于失败的 Job 个数。
 	FailedBundles int
 	Elapsed       time.Duration
+}
+
+// EventFileSkipped 在某个目标文件被判定为无需处理（内容与新清单一致，整文件跳过）时发出。
+type EventFileSkipped struct {
+	eventBase
+	Path string
+}
+
+// EventChunkReused 在某段数据从本地磁盘复用（未经网络下载）时发出。
+// Bytes 为复用的解压域字节数。
+type EventChunkReused struct {
+	eventBase
+	Path  string
+	Bytes int64
+}
+
+// EventFileRenamed 在暂存文件被提交（原子 rename）为最终文件时发出。
+type EventFileRenamed struct {
+	eventBase
+	From string
+	To   string
+}
+
+// EventFileRemoved 在文件被删除时发出（如清理旧清单中已不存在的路径）。
+type EventFileRemoved struct {
+	eventBase
+	Path string
 }

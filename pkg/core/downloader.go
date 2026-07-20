@@ -117,7 +117,11 @@ func (d *Downloader) emit(event DownloadEvent) {
 	}
 }
 
-// Download 执行完整的下载流程。
+// Download 执行完整的下载流程：预分配 staging → Mapper → DownloadTasks（自管 staging）。
+//
+// 对外签名与语义与重构前一致：接收完整文件列表，内部据此下载全部 Chunk 并在成功
+// 后覆盖 outputDir 下的最终文件。变化的只是写入方式——现在一律先落 staging 文件，
+// 全部作业成功后才原子替换旧文件，中途失败时旧文件保持完整。
 func (d *Downloader) Download(ctx context.Context, files []rman.FileEntry) error {
 	defer close(d.events)
 	defer d.filePool.Close()
@@ -125,7 +129,7 @@ func (d *Downloader) Download(ctx context.Context, files []rman.FileEntry) error
 
 	startTime := time.Now()
 
-	// 1. 文件预分配
+	// 1. 文件预分配（落 StagingPath，旧文件在提交前不受影响）
 	if err := d.preallocateFiles(ctx, files); err != nil {
 		return fmt.Errorf("文件预分配失败: %w", err)
 	}
@@ -133,13 +137,8 @@ func (d *Downloader) Download(ctx context.Context, files []rman.FileEntry) error
 	// 2. Mapper
 	taskMap := Map(files)
 
-	// 3. Scheduler（含 Gap Tolerance）
-	jobs := Schedule(taskMap, ScheduleConfig{
-		MaxRangesPerReq: d.config.MaxRangesPerReq,
-		GapTolerance:    d.config.GapTolerance,
-	})
-
-	// 统计总量
+	// 统计总量（供下方 EventComplete 使用；DownloadTasks 内部不感知“完整文件列表”
+	// 这一概念，因此总量统计留在 Download 这一层，与重构前保持一致的口径）
 	var totalChunks int
 	var totalBytes int64
 	for _, tasks := range taskMap {
@@ -149,40 +148,154 @@ func (d *Downloader) Download(ctx context.Context, files []rman.FileEntry) error
 		}
 	}
 
-	// 4. Worker Pool
+	// 3. Scheduler + Worker Pool + staging 提交/丢弃，全部收敛到 DownloadTasks
+	failed, err := d.DownloadTasks(ctx, taskMap, TaskOptions{ManageStaging: true})
+
+	// 4. 完成事件
+	d.emit(EventComplete{
+		TotalFiles:    len(files),
+		TotalChunks:   totalChunks,
+		TotalBytes:    totalBytes,
+		FailedBundles: len(failed),
+		Elapsed:       time.Since(startTime),
+	})
+
+	return err
+}
+
+// TaskOptions 控制 DownloadTasks 对 staging 生命周期的管理范围。
+type TaskOptions struct {
+	// ManageStaging 为 true 时，DownloadTasks 在全部作业处理完毕后自行提交或丢弃
+	// 涉及的 staging 文件：非失败文件 ClosePath+CommitStaging（原子替换为最终文件，
+	// 发 EventFileRenamed），失败文件 ClosePath+DiscardStaging（保留旧文件）。
+	// staging 文件本身的预分配（创建/Truncate）不属于这一步，由调用方在此之前完成
+	// （Download 通过 preallocateFiles 承担；增量更新编排器按需自行预分配）。
+	//
+	// ManageStaging 为 false 时，DownloadTasks 只对已经存在的 StagingPath(FilePath)
+	// 执行写入，既不预分配也不提交/丢弃——staging 的创建、提交、丢弃全部归调用方
+	// （增量更新编排器）负责，便于其把 Chunk 级复用写入与网络下载写入合并到同一份
+	// staging 文件后再统一提交。
+	ManageStaging bool
+}
+
+// DownloadTasks 执行一个预构建任务集（taskMap，通常是 Map 的输出或其子集）的
+// 下载→解压→写盘流程，是 Download 与增量更新编排器共用的下载执行入口。
+//
+// 与 Download 不同，DownloadTasks 不做 Mapper：调用方决定 taskMap 覆盖哪些 Chunk，
+// 使得增量更新场景可以只灌入本地验证 miss 的 Chunk 子集，Schedule 阶段的 Gap
+// Tolerance 合并、30 段上限拆分、Bundle 级重试完全复用，不需要重新实现。
+//
+// 写入统一落 StagingPath(FilePath)：无论 ManageStaging 取值，处理过程中都不会
+// 触碰最终路径，保证旧文件字节在提交前保持不变。
+//
+// failed 是关联到失败作业（重试耗尽）的目标文件 FilePath 集合：一个 BundleJob 内
+// 任意 Chunk 的处理最终失败，都会导致该 Job 覆盖的全部 Targets.FilePath 计入
+// failed，即便同一文件的其他 Chunk 所在 Job 已成功——一个文件只要有一个 Chunk
+// 未确认写入完整，就不能判定它可信，不能提交为最终文件。
+func (d *Downloader) DownloadTasks(ctx context.Context, taskMap map[uint64][]GlobalChunkTask, opts TaskOptions) (map[string]bool, error) {
+	jobs := Schedule(taskMap, ScheduleConfig{
+		MaxRangesPerReq: d.config.MaxRangesPerReq,
+		GapTolerance:    d.config.GapTolerance,
+	})
+
 	jobCh := make(chan BundleJob, len(jobs))
 	for _, job := range jobs {
 		jobCh <- job
 	}
 	close(jobCh)
 
-	var failedBundles atomic.Int32
+	failed := make(map[string]bool)
+	var failedMu sync.Mutex
+
 	var wg sync.WaitGroup
 	for i := 0; i < d.config.Workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d.worker(ctx, jobCh, &failedBundles)
+			d.taskWorker(ctx, jobCh, &failedMu, failed)
 		}()
 	}
-
 	wg.Wait()
 
-	// 5. 完成事件
-	d.emit(EventComplete{
-		TotalFiles:    len(files),
-		TotalChunks:   totalChunks,
-		TotalBytes:    totalBytes,
-		FailedBundles: int(failedBundles.Load()),
-		Elapsed:       time.Since(startTime),
-	})
+	if ctx.Err() != nil {
+		// Context 取消时 jobCh 中可能仍有未处理的 Job（worker 提前退出），无法确认
+		// 这些 Job 对应的 staging 是否完整，因此不做任何提交/丢弃，保持旧文件不变，
+		// 交由调用方决定后续处理。
+		return failed, ctx.Err()
+	}
 
-	if failedBundles.Load() > 0 {
-		return fmt.Errorf("下载完成但有 %d 个 Bundle 失败", failedBundles.Load())
+	if opts.ManageStaging {
+		if err := d.finalizeStaging(taskMap, failed); err != nil {
+			return failed, err
+		}
+	}
+
+	if len(failed) > 0 {
+		return failed, fmt.Errorf("下载完成但有 %d 个目标文件关联的 Bundle 失败", len(failed))
+	}
+	return failed, nil
+}
+
+// finalizeStaging 在全部作业处理完毕后，对 taskMap 涉及的每个目标文件提交或丢弃
+// 对应的 staging 文件：未失败的文件 ClosePath+CommitStaging（用 staging 内容原子
+// 替换目标文件，发 EventFileRenamed）；失败的文件 ClosePath+DiscardStaging（保留
+// 旧文件，删除半成品 staging）。ClosePath 必须先于 rename/remove 调用——Windows
+// 下无法对仍持有打开句柄的文件执行这两个操作。
+func (d *Downloader) finalizeStaging(taskMap map[uint64][]GlobalChunkTask, failed map[string]bool) error {
+	seen := make(map[string]bool)
+	for _, tasks := range taskMap {
+		for _, task := range tasks {
+			for _, target := range task.Targets {
+				if seen[target.FilePath] {
+					continue
+				}
+				seen[target.FilePath] = true
+
+				fullPath, err := outputPath(d.config.OutputDir, target.FilePath)
+				if err != nil {
+					return err
+				}
+				stagingPath := fswriter.StagingPath(fullPath)
+
+				if err := d.filePool.ClosePath(stagingPath); err != nil {
+					return fmt.Errorf("关闭暂存文件句柄失败 %s: %w", stagingPath, err)
+				}
+
+				if failed[target.FilePath] {
+					if err := fswriter.DiscardStaging(fullPath); err != nil {
+						return fmt.Errorf("丢弃暂存文件失败 %s: %w", fullPath, err)
+					}
+					continue
+				}
+
+				if err := fswriter.CommitStaging(fullPath); err != nil {
+					return fmt.Errorf("提交暂存文件失败 %s: %w", fullPath, err)
+				}
+				d.emit(EventFileRenamed{From: stagingPath, To: fullPath})
+			}
+		}
 	}
 	return nil
 }
 
+// jobFilePaths 返回 job 覆盖到的全部目标文件的 FilePath（去重，即 WriteTarget.FilePath，
+// 清单相对路径而非磁盘绝对路径）。
+func jobFilePaths(job BundleJob) map[string]bool {
+	paths := make(map[string]bool)
+	for _, r := range job.Ranges {
+		for _, chunk := range r.Chunks {
+			for _, target := range chunk.Targets {
+				paths[target.FilePath] = true
+			}
+		}
+	}
+	return paths
+}
+
+// preallocateFiles 为每个非空文件预分配 staging 空间（创建目录 + Truncate 到目标
+// 大小），写入过程中始终只触碰 StagingPath，最终路径下的旧文件保持不变直到提交。
+// EventFilePreallocated.Path 报告的是最终路径而非 staging 路径——staging 后缀是
+// 实现细节，对事件消费方（进度展示）没有意义。
 func (d *Downloader) preallocateFiles(ctx context.Context, files []rman.FileEntry) error {
 	for _, f := range files {
 		if ctx.Err() != nil {
@@ -195,7 +308,7 @@ func (d *Downloader) preallocateFiles(ctx context.Context, files []rman.FileEntr
 		if err != nil {
 			return err
 		}
-		if err := d.filePool.PreallocateFile(fullPath, int64(f.FileSize)); err != nil {
+		if err := d.filePool.PreallocateFile(fswriter.StagingPath(fullPath), int64(f.FileSize)); err != nil {
 			return err
 		}
 		d.emit(EventFilePreallocated{Path: fullPath, Size: int64(f.FileSize)})
@@ -203,23 +316,29 @@ func (d *Downloader) preallocateFiles(ctx context.Context, files []rman.FileEntr
 	return nil
 }
 
-// worker 从 jobCh 获取 BundleJob，带重试执行下载。
-func (d *Downloader) worker(
+// taskWorker 从 jobCh 获取 BundleJob，带重试执行下载；Job 最终失败时把其覆盖的
+// 全部目标文件 FilePath 计入 failed。
+func (d *Downloader) taskWorker(
 	ctx context.Context,
 	jobCh <-chan BundleJob,
-	failedBundles *atomic.Int32,
+	failedMu *sync.Mutex,
+	failed map[string]bool,
 ) {
 	for job := range jobCh {
 		if ctx.Err() != nil {
 			return
 		}
 		if err := d.processBundleWithRetry(ctx, job); err != nil {
-			failedBundles.Add(1)
 			d.emit(EventError{
 				BundleID:       job.BundleID,
 				BundleFilename: job.BundleFilename,
 				Err:            err,
 			})
+			failedMu.Lock()
+			for path := range jobFilePaths(job) {
+				failed[path] = true
+			}
+			failedMu.Unlock()
 		}
 	}
 }
@@ -337,9 +456,12 @@ func (d *Downloader) processBundle(ctx context.Context, job BundleJob) error {
 				if pathErr != nil {
 					return pathErr
 				}
-				if _, writeErr := d.filePool.WriteAt(fullPath, decompressed, target.FileOffset); writeErr != nil {
+				// 写入一律落 staging 路径：无论调用方是 Download 还是增量更新编排器，
+				// 都不会在这一步触碰最终文件，保证提交前旧文件字节不受影响。
+				stagingPath := fswriter.StagingPath(fullPath)
+				if _, writeErr := d.filePool.WriteAt(stagingPath, decompressed, target.FileOffset); writeErr != nil {
 					return fmt.Errorf("写入文件 %s 偏移 %d 失败: %w",
-						fullPath, target.FileOffset, writeErr)
+						stagingPath, target.FileOffset, writeErr)
 				}
 			}
 

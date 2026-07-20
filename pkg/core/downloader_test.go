@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Virace/RiotManifestGo/internal/fswriter"
 	"github.com/Virace/RiotManifestGo/internal/zstream"
 	"github.com/Virace/RiotManifestGo/pkg/rman"
 	"github.com/klauspost/compress/zstd"
@@ -19,11 +20,13 @@ import (
 
 // mockFetcher 是 BundleFetcher 的测试 mock 实现。
 type mockFetcher struct {
-	mu         sync.Mutex
-	callCount  int
-	failUntil  int                    // 前 failUntil 次调用返回 error
-	responses  map[string][]rangeResp // bundleFilename → Range 级别响应
-	fetchError error                  // 始终返回的 error（优先于 failUntil）
+	mu              sync.Mutex
+	callCount       int
+	failUntil       int                                                               // 前 failUntil 次调用返回 error
+	responses       map[string][]rangeResp                                            // bundleFilename → Range 级别响应（按调用顺序返回整批，不关心具体 Range 边界）
+	fetchError      error                                                             // 始终返回的 error（优先于 failUntil）
+	rangeFunc       func(bundleFilename string, ranges []ByteRange) ([][]byte, error) // 优先于 responses：按实际请求的 Range 精确应答，用于断言"只请求了预期的字节区间"
+	requestedRanges []ByteRange                                                       // 记录所有调用中实际收到的 ranges，用于断言子集下载未越界请求
 }
 
 type rangeResp struct {
@@ -40,6 +43,8 @@ func (m *mockFetcher) FetchRanges(ctx context.Context, bundleFilename string, ra
 	m.mu.Lock()
 	m.callCount++
 	count := m.callCount
+	m.requestedRanges = append(m.requestedRanges, ranges...)
+	rangeFunc := m.rangeFunc
 	m.mu.Unlock()
 
 	if m.fetchError != nil {
@@ -48,6 +53,10 @@ func (m *mockFetcher) FetchRanges(ctx context.Context, bundleFilename string, ra
 
 	if count <= m.failUntil {
 		return nil, fmt.Errorf("mock 第 %d 次调用失败（模拟网络错误）", count)
+	}
+
+	if rangeFunc != nil {
+		return rangeFunc(bundleFilename, ranges)
 	}
 
 	resps, ok := m.responses[bundleFilename]
@@ -619,5 +628,343 @@ func TestDownloadDefaultMaxRetriesUsesThreeRetries(t *testing.T) {
 	}
 	if !bytes.Equal(content, chunkData) {
 		t.Fatal("默认重试后的文件内容不匹配")
+	}
+}
+
+// ---- DownloadTasks / staging 测试 ----
+
+// TestDownloadTasksSubset 验证 DownloadTasks 接受部分任务集时，只会向 BundleFetcher
+// 请求这部分任务对应的字节区间：Map 出 10 个 Chunk 后只把其中 3 个（非相邻）灌入
+// DownloadTasks，mock 只为这 3 个 Chunk 自身的字节跨度配置了响应，若实现意外请求了
+// 其余 7 个 Chunk 的区间会直接报错，从而证明子集语义。
+func TestDownloadTasksSubset(t *testing.T) {
+	config, dir := makeTestConfig(t)
+
+	const bundleID uint64 = 0x1000000000000001
+
+	// 10 个 Chunk 连续排列在同一 Bundle 内，全部属于同一个文件。
+	chunks := make([]testChunkData, 0, 10)
+	var bundleOffset uint32
+	for i := 0; i < 10; i++ {
+		data := []byte(fmt.Sprintf("chunk-%02d-payload-content-data!!", i))
+		c := makeTestChunk(t, data, bundleID, bundleOffset)
+		chunks = append(chunks, c)
+		bundleOffset += c.compSize
+	}
+	file := makeTestFileEntry("subset/full.bin", chunks...)
+
+	fullTaskMap := Map([]rman.FileEntry{file})
+	fullTasks := fullTaskMap[bundleID]
+	if len(fullTasks) != 10 {
+		t.Fatalf("Map 产出的任务数 = %d, 期望 10", len(fullTasks))
+	}
+
+	// 只取索引 1、4、7 三个非相邻任务组成子集，其余 7 个不应被下载。
+	subsetIdx := []int{1, 4, 7}
+	subset := make([]GlobalChunkTask, 0, len(subsetIdx))
+	for _, idx := range subsetIdx {
+		subset = append(subset, fullTasks[idx])
+	}
+	subsetTaskMap := map[uint64][]GlobalChunkTask{bundleID: subset}
+
+	// 按精确字节区间应答：只为子集中 3 个 Chunk 自身的跨度配置响应。
+	spanData := make(map[[2]int64][]byte, len(subsetIdx))
+	for _, idx := range subsetIdx {
+		c := chunks[idx]
+		start := int64(c.bundleOffset)
+		end := start + int64(c.compSize) - 1
+		spanData[[2]int64{start, end}] = c.compressed
+	}
+
+	mock := newMockFetcher()
+	mock.rangeFunc = func(bundleFilename string, ranges []ByteRange) ([][]byte, error) {
+		result := make([][]byte, len(ranges))
+		for i, r := range ranges {
+			data, ok := spanData[[2]int64{r.Start, r.End}]
+			if !ok {
+				return nil, fmt.Errorf("mock: 请求了子集之外的区间 start=%d end=%d", r.Start, r.End)
+			}
+			result[i] = data
+		}
+		return result, nil
+	}
+
+	dl := NewDownloaderWithFetcher(config, mock)
+	defer dl.filePool.Close()
+	events := dl.Events()
+	var eventWg sync.WaitGroup
+	eventWg.Add(1)
+	go func() {
+		defer eventWg.Done()
+		for range events {
+		}
+	}()
+
+	ctx := context.Background()
+	if err := dl.preallocateFiles(ctx, []rman.FileEntry{file}); err != nil {
+		t.Fatalf("preallocateFiles 失败: %v", err)
+	}
+
+	failed, err := dl.DownloadTasks(ctx, subsetTaskMap, TaskOptions{ManageStaging: true})
+	close(dl.events)
+	eventWg.Wait()
+
+	if err != nil {
+		t.Fatalf("DownloadTasks 失败: %v", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("failed 集合应为空，实际: %v", failed)
+	}
+
+	mock.mu.Lock()
+	requested := len(mock.requestedRanges)
+	mock.mu.Unlock()
+	if requested != len(subsetIdx) {
+		t.Errorf("请求的 Range 数 = %d, 期望 %d（子集大小）", requested, len(subsetIdx))
+	}
+
+	content, err := os.ReadFile(filepath.Join(dir, "subset", "full.bin"))
+	if err != nil {
+		t.Fatalf("读取输出文件失败: %v", err)
+	}
+
+	var fileOffset int64
+	for i, c := range chunks {
+		inSubset := false
+		for _, idx := range subsetIdx {
+			if idx == i {
+				inSubset = true
+				break
+			}
+		}
+
+		want := make([]byte, c.uncompSize)
+		if inSubset {
+			copy(want, c.raw)
+		}
+		// 不在子集内的 Chunk 从未被写入，应保持 PreallocateFile 截断产生的零值填充。
+
+		got := content[fileOffset : fileOffset+int64(c.uncompSize)]
+		if !bytes.Equal(got, want) {
+			t.Errorf("Chunk[%d] 内容不符 (inSubset=%v): got=%q want=%q", i, inSubset, got, want)
+		}
+		fileOffset += int64(c.uncompSize)
+	}
+}
+
+// TestDownloadTasksNoStagingManagement 验证 ManageStaging=false 时 DownloadTasks
+// 既不会自行创建/预分配 staging 文件，也不会在完成后提交或丢弃 staging：staging 的
+// 创建与提交/丢弃完全归调用方负责，DownloadTasks 只对调用方已经准备好的
+// StagingPath(FilePath) 执行写入。
+func TestDownloadTasksNoStagingManagement(t *testing.T) {
+	config, dir := makeTestConfig(t)
+	config.MaxRetries = -1 // 不重试，加速失败路径
+
+	const bundleID1 uint64 = 0x4000000000000001
+	const bundleID2 uint64 = 0x4000000000000002
+
+	readyData := []byte("chunk data for a caller-managed staging file!!!")
+	readyChunk := makeTestChunk(t, readyData, bundleID1, 0)
+	readyFile := makeTestFileEntry("nostage/ready.bin", readyChunk)
+
+	missingData := []byte("chunk data for a file whose staging was never made")
+	missingChunk := makeTestChunk(t, missingData, bundleID2, 0)
+	missingFile := makeTestFileEntry("nostage/missing.bin", missingChunk)
+
+	taskMap := Map([]rman.FileEntry{readyFile, missingFile})
+
+	mock := newMockFetcher()
+	setupMockResponse(t, mock, bundleID1, readyChunk)
+	setupMockResponse(t, mock, bundleID2, missingChunk)
+
+	dl := NewDownloaderWithFetcher(config, mock)
+	defer dl.filePool.Close()
+	events := dl.Events()
+	var eventWg sync.WaitGroup
+	eventWg.Add(1)
+	go func() {
+		defer eventWg.Done()
+		for range events {
+		}
+	}()
+
+	readyPath := filepath.Join(dir, "nostage", "ready.bin")
+	oldReadyContent := []byte("old content, must remain untouched by a non-managed staging write")
+	if err := os.MkdirAll(filepath.Dir(readyPath), 0755); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+	if err := os.WriteFile(readyPath, oldReadyContent, 0644); err != nil {
+		t.Fatalf("写入旧目标文件失败: %v", err)
+	}
+	// 调用方（模拟增量更新编排器）自行预分配 ready.bin 的 staging，DownloadTasks 只写入。
+	if err := dl.filePool.PreallocateFile(fswriter.StagingPath(readyPath), int64(len(readyData))); err != nil {
+		t.Fatalf("PreallocateFile 失败: %v", err)
+	}
+
+	// missing.bin 的 staging 故意不预分配，验证 DownloadTasks 不会替调用方创建它。
+	missingPath := filepath.Join(dir, "nostage", "missing.bin")
+
+	failed, err := dl.DownloadTasks(context.Background(), taskMap, TaskOptions{ManageStaging: false})
+	close(dl.events)
+	eventWg.Wait()
+
+	if err == nil {
+		t.Fatal("missing.bin 的 staging 未预分配，DownloadTasks 应返回 error")
+	}
+	if !failed["nostage/missing.bin"] {
+		t.Errorf("failed 集合应包含 nostage/missing.bin, 实际: %v", failed)
+	}
+	if failed["nostage/ready.bin"] {
+		t.Errorf("failed 集合不应包含 nostage/ready.bin, 实际: %v", failed)
+	}
+
+	// ready.bin: 写入应落在 staging，目标文件本身保持旧内容（未提交）。
+	readyContent, err := os.ReadFile(readyPath)
+	if err != nil {
+		t.Fatalf("读取 ready.bin 失败: %v", err)
+	}
+	if !bytes.Equal(readyContent, oldReadyContent) {
+		t.Errorf("ManageStaging=false 不应提交 staging: got %q, want %q", readyContent, oldReadyContent)
+	}
+
+	stagingContent, err := os.ReadFile(fswriter.StagingPath(readyPath))
+	if err != nil {
+		t.Fatalf("读取 ready.bin 暂存文件失败: %v", err)
+	}
+	if !bytes.Equal(stagingContent, readyData) {
+		t.Errorf("staging 内容 = %q, 期望 %q", stagingContent, readyData)
+	}
+
+	// missing.bin: 目标文件与 staging 均不应被创建——DownloadTasks 没有替调用方建任何东西。
+	if _, statErr := os.Stat(missingPath); !os.IsNotExist(statErr) {
+		t.Errorf("missing.bin 不应被创建")
+	}
+	if _, statErr := os.Stat(fswriter.StagingPath(missingPath)); !os.IsNotExist(statErr) {
+		t.Errorf("missing.bin 的暂存文件不应被创建")
+	}
+}
+
+// TestDownloadWritesStagingAndCommits 验证既有 Download 路径下 staging 的提交时机：
+// 目标旧文件在全部作业完成之前字节必须保持不变（写入只落 staging），只有全部作业
+// 成功后才会被原子替换为新内容。
+func TestDownloadWritesStagingAndCommits(t *testing.T) {
+	config, dir := makeTestConfig(t)
+
+	const bundleID uint64 = 0x2000000000000001
+	oldContent := []byte("old file content, should remain until commit!!")
+	newData := []byte("brand new committed content data!!")
+	chunk := makeTestChunk(t, newData, bundleID, 0)
+	file := makeTestFileEntry("commit/target.bin", chunk)
+
+	targetPath := filepath.Join(dir, "commit", "target.bin")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+	if err := os.WriteFile(targetPath, oldContent, 0644); err != nil {
+		t.Fatalf("写入旧目标文件失败: %v", err)
+	}
+
+	block := make(chan struct{})
+	proceed := make(chan struct{})
+	mock := newMockFetcher()
+	mock.rangeFunc = func(bundleFilename string, ranges []ByteRange) ([][]byte, error) {
+		close(block) // 通知主线程：下载即将写入，可以检查目标文件当前状态
+		<-proceed    // 等待主线程放行，模拟下载仍在进行中
+		return [][]byte{chunk.compressed}, nil
+	}
+
+	dl := NewDownloaderWithFetcher(config, mock)
+	events := dl.Events()
+	var eventWg sync.WaitGroup
+	eventWg.Add(1)
+	go func() {
+		defer eventWg.Done()
+		for range events {
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- dl.Download(context.Background(), []rman.FileEntry{file})
+	}()
+
+	<-block
+	// 下载仍阻塞在 FetchRanges 内部，尚未写入任何 staging 数据：目标文件应保持旧内容。
+	mid, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("读取目标文件失败: %v", err)
+	}
+	if !bytes.Equal(mid, oldContent) {
+		t.Errorf("下载完成前目标文件已被改动: got %q, want %q", mid, oldContent)
+	}
+	close(proceed)
+
+	if err := <-done; err != nil {
+		t.Fatalf("Download 失败: %v", err)
+	}
+	eventWg.Wait()
+
+	final, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("读取目标文件失败: %v", err)
+	}
+	if !bytes.Equal(final, newData) {
+		t.Errorf("Download 完成后目标文件未被替换为新内容: got %q, want %q", final, newData)
+	}
+
+	if _, statErr := os.Stat(fswriter.StagingPath(targetPath)); !os.IsNotExist(statErr) {
+		t.Errorf("提交后暂存文件应已消失, stat err=%v", statErr)
+	}
+}
+
+// TestFailedFileKeepsOldAndDiscardsStaging 验证一个文件关联的 Bundle 作业最终失败
+// （重试耗尽）时：旧文件保持不变，半成品 staging 被丢弃。
+func TestFailedFileKeepsOldAndDiscardsStaging(t *testing.T) {
+	config, dir := makeTestConfig(t)
+	config.MaxRetries = -1 // 不重试，加速失败路径
+
+	const bundleID uint64 = 0x3000000000000001
+	oldContent := []byte("old content that must survive a failed download")
+	chunk := makeTestChunk(t, []byte("irrelevant new data, never lands on disk"), bundleID, 0)
+	file := makeTestFileEntry("fail/keep.bin", chunk)
+
+	targetPath := filepath.Join(dir, "fail", "keep.bin")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+	if err := os.WriteFile(targetPath, oldContent, 0644); err != nil {
+		t.Fatalf("写入旧目标文件失败: %v", err)
+	}
+
+	mock := newMockFetcher()
+	mock.fetchError = fmt.Errorf("永久性网络错误")
+
+	dl := NewDownloaderWithFetcher(config, mock)
+	events := dl.Events()
+	var eventWg sync.WaitGroup
+	eventWg.Add(1)
+	go func() {
+		defer eventWg.Done()
+		for range events {
+		}
+	}()
+
+	err := dl.Download(context.Background(), []rman.FileEntry{file})
+	eventWg.Wait()
+
+	if err == nil {
+		t.Fatal("Download 应因 Bundle 失败返回 error")
+	}
+
+	got, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("读取目标文件失败: %v", err)
+	}
+	if !bytes.Equal(got, oldContent) {
+		t.Errorf("失败后旧文件应保持不变: got %q, want %q", got, oldContent)
+	}
+
+	if _, statErr := os.Stat(fswriter.StagingPath(targetPath)); !os.IsNotExist(statErr) {
+		t.Errorf("失败后暂存文件应已被丢弃, stat err=%v", statErr)
 	}
 }

@@ -75,12 +75,11 @@ func main() {
 
 	// 1. 解析 Manifest
 	printer.info("📄 解析 manifest: %s\n", manifestSource)
-	// manifestRaw/manifestSource 保留原始字节与来源字符串，供后续编排任务
-	// （自动发现旧版本时调用 update.Archive.Save 存档）使用，本次改动不在此处消费。
 	manifest, manifestRaw, err := loadManifest(manifestSource)
 	if err != nil {
 		log.Fatalf("❌ 解析失败: %v", err)
 	}
+	// manifest 原始字节供存档逻辑（update.Archive.Save）消费；CLI 尚未接入存档，显式丢弃。
 	_ = manifestRaw
 	printer.info("✅ ManifestID: %016X | 文件总数: %d\n\n", manifest.ManifestID, len(manifest.Files))
 
@@ -335,7 +334,7 @@ func heartbeat(dl *downloadLog, stop <-chan struct{}) {
 // ---- 远程 Manifest 获取 ----
 
 // loadManifest 解析 manifest，同时返回其原始字节，供调用方在需要时存档
-// （例如后续编排任务写入 update.Archive）。
+// （写入 update.Archive）。
 func loadManifest(source string) (*rman.Manifest, []byte, error) {
 	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
 		return loadManifestFromURL(source)

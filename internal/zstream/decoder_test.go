@@ -89,8 +89,7 @@ func TestDecoder_DecompressAndValidate_WrongSize(t *testing.T) {
 }
 
 // TestDecoder_DecompressAndValidate_HashTypeNone 验证 HashTypeNone 的 chunk
-// 解压 + 大小校验通过后即接受（跳过哈希校验，对齐 PyManifest 下载路径契约），
-// 但解压大小不匹配仍然报错。
+// 解压 + 大小校验通过后即接受（跳过哈希校验），但解压大小不匹配仍然报错。
 func TestDecoder_DecompressAndValidate_HashTypeNone(t *testing.T) {
 	original := []byte("chunk data without params entry")
 	compressed := compressTestData(t, original)

@@ -1,6 +1,6 @@
 // Package update 实现本地增量更新的"版本锚点"：将成功获取到的原始 manifest
 // 字节存档到 <output>/.rman/manifests/ 下，并通过 <output>/.rman/installed.json
-// 记录当前指向的版本，供后续编排逻辑自动发现上一份已安装的 manifest。
+// 记录当前指向的版本，供更新流程自动发现上一份已安装的 manifest。
 //
 // installed.json 的字段/格式是与姊妹 Python 项目共享的固定契约（schema=1），
 // 修改需双侧同步，不得随意调整字段名或格式。

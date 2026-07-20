@@ -7,6 +7,12 @@ package rman
 type HashType uint8
 
 const (
+	// HashTypeNone 无哈希类型（HashType 字段零值）。
+	// 出现于该文件的 param_index 越界（未指向有效 Parameters 条目），或对应
+	// Parameters 条目自身的 hash_type 字段为 0/缺省时（见 Parser.parseFileEntries
+	// 与 parseParameters），此时无法直接判断 ChunkID 对应的哈希算法，
+	// 需要由消费方穷举猜测（参考 rman RChunk::hash_type 的猜测策略）。
+	HashTypeNone HashType = 0
 	// HashTypeSHA512 SHA-512 哈希（极少使用）
 	HashTypeSHA512 HashType = 1
 	// HashTypeSHA256 SHA-256 哈希
@@ -20,6 +26,8 @@ const (
 // String 返回 HashType 的可读字符串。
 func (h HashType) String() string {
 	switch h {
+	case HashTypeNone:
+		return "None"
 	case HashTypeSHA512:
 		return "SHA512"
 	case HashTypeSHA256:

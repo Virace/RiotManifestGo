@@ -44,9 +44,11 @@ type Options struct {
 	// 自动发现，仍找不到时视为无旧清单。ModeRepair/ModeVerifyOnly/ModeForceFull
 	// 不使用旧清单，此字段被忽略。
 	OldManifestPath string
-	// RemoveDeleted 控制是否删除 diff 判定为 Removed 的旧路径；调用方需要
-	// "默认删除"语义时应显式传 true（CLI -keep-removed 置 false）。只删除
-	// diff.Result.Removed 列表内的路径，不做任何其他清理。
+	// RemoveDeleted 控制是否清理"旧内容不再需要保留"的路径；调用方需要
+	// "默认删除"语义时应显式传 true（CLI -keep-removed 置 false）。涵盖两类
+	// 路径：diff.Result.Removed 列表（旧清单有、新清单已不存在）；以及每个成功
+	// 提交的 Moved 配对的旧路径（新清单里已经以新路径存在，旧路径只是重命名前
+	// 的副本）。不做这两类之外的任何其他清理。
 	RemoveDeleted bool
 }
 
@@ -60,7 +62,9 @@ type Stats struct {
 	Patched []string // 本地已存在、按 chunk 级命中+下载补洞后提交的文件（新路径）
 	Created []string // 本地不存在、整个从网络下载后提交的文件（新路径）
 	Moved   []string // 从旧路径整文件复制并提交的文件（新路径）
-	Removed []string // 已从磁盘删除的旧路径（仅 RemoveDeleted 时可能非空）
+	Removed []string // 已从磁盘删除的旧路径（仅 RemoveDeleted 时可能非空）；
+	// 只对应 diff.Result.Removed 列表，成功 Moved 配对的旧路径清理不计入这里
+	// （该迁移语义已由 EventFileRenamed 表达，见 Options.RemoveDeleted 注释）。
 	// Failed 记录未能确认最终正确的文件：下载失败、Moved 源读取失败，或（仅
 	// ModeVerifyOnly 下）验证发现本地缺失/损坏的 chunk——ModeVerifyOnly 本身
 	// 零写盘，因此这里不代表下载失败，而是"需要一次真正的 Sync 才能修复"。
@@ -73,8 +77,9 @@ type pendingFile struct {
 	path        string // 清单相对路径（新路径）
 	fullPath    string
 	stagingPath string
-	exists      bool  // patch 类：处理前磁盘上是否已存在同名文件（Created 与 Patched 的分类依据）
-	reusedBytes int64 // 本地复用（读旧文件写 staging）的字节数
+	movedFrom   string // 仅 moved=true 时有效：旧路径的磁盘绝对路径，提交成功后按 RemoveDeleted 清理
+	exists      bool   // patch 类：处理前磁盘上是否已存在同名文件（Created 与 Patched 的分类依据）
+	reusedBytes int64  // 本地复用（读旧文件写 staging）的字节数
 }
 
 // Sync 是增量更新编排器：比较新旧清单、按 chunk 级复用本地数据、把缺失的 chunk
@@ -193,7 +198,10 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 	}
 
 	// 步骤 6：提交/丢弃。非 failed 文件 ClosePath+CommitStaging（含 Moved，发
-	// EventFileRenamed）；failed 文件 ClosePath+DiscardStaging。
+	// EventFileRenamed）；failed 文件 ClosePath+DiscardStaging。Moved 成功提交后
+	// 额外记下其旧路径，供本步骤末尾按 RemoveDeleted 决定是否清理源文件——旧路径
+	// 此时只是重命名前的内容重复副本，不应该跟随提交结果永久留在磁盘上。
+	var movedSources []string
 	for _, pf := range pending {
 		isFailed := failedSet[pf.path]
 		closeErr := pool.ClosePath(pf.stagingPath)
@@ -211,6 +219,7 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 
 		if pf.moved {
 			stats.Moved = append(stats.Moved, pf.path)
+			movedSources = append(movedSources, pf.movedFrom)
 			continue
 		}
 		stats.DownloadedBytes += downloadedByPath[pf.path]
@@ -221,8 +230,11 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 		}
 	}
 
-	// 步骤 7：RemoveDeleted → 删除 Removed 路径（仅此列表），发 EventFileRemoved。
+	// 步骤 7：RemoveDeleted → 删除 diff.Result.Removed 路径（发 EventFileRemoved）
+	// 与成功提交的 Moved 旧路径（不计入 Stats.Removed、不发额外事件——
+	// EventFileRenamed 已经表达了 From→To 的迁移语义，见 removeMovedSources 注释）。
 	if opts.RemoveDeleted {
+		removeMovedSources(movedSources)
 		if err := removeDeleted(outputDir, diffResult.Removed, d, &stats); err != nil {
 			return stats, err
 		}
@@ -308,9 +320,22 @@ func verifyOnlySync(ctx context.Context, entries []rman.FileEntry, outputDir str
 	return stats, nil
 }
 
+// discardPreallocatedStaging 尽力清理一个已经 PreallocateFile 成功、但调用方在
+// 提交流程（步骤 6）之前就失败退出的 staging：先 ClosePath 释放 FilePool 持有的
+// 句柄（Windows 下句柄未释放会导致后续删除失败），再删除 staging 文件本身。这两
+// 步失败都不覆盖调用方已经拿到的真实错误，属于尽力而为的收尾。
+func discardPreallocatedStaging(pool *fswriter.FilePool, fullPath, stagingPath string) {
+	_ = pool.ClosePath(stagingPath)
+	_ = fswriter.DiscardStaging(fullPath)
+}
+
 // processMoved 把旧路径 srcPath 的整文件内容按流式方式复制到 fullPath 对应的
 // staging：内容已由 diff 阶段的 ChunkID 序列相等性担保一致，因此不做逐 chunk
 // 校验，只做一次顺序读写（而非一次性读入内存，兼容大文件）。
+//
+// 预分配 staging 之后的任何错误退出（源文件打开/读取失败、写入 staging 失败）都
+// 会先清理已经创建的 staging，不依赖调用方后续统一收尾——这类错误发生在文件进入
+// 步骤 6 的提交/丢弃流程之前，不清理就会残留半成品 staging。
 func processMoved(path, fullPath, srcPath string, fileSize uint64, pool *fswriter.FilePool, d *core.Downloader) (pendingFile, error) {
 	stagingPath := fswriter.StagingPath(fullPath)
 	if err := pool.PreallocateFile(stagingPath, int64(fileSize)); err != nil {
@@ -319,6 +344,7 @@ func processMoved(path, fullPath, srcPath string, fileSize uint64, pool *fswrite
 
 	src, err := os.Open(srcPath)
 	if err != nil {
+		discardPreallocatedStaging(pool, fullPath, stagingPath)
 		return pendingFile{}, err
 	}
 	defer src.Close()
@@ -329,6 +355,7 @@ func processMoved(path, fullPath, srcPath string, fileSize uint64, pool *fswrite
 		n, readErr := src.Read(buf)
 		if n > 0 {
 			if _, writeErr := pool.WriteAt(stagingPath, buf[:n], offset); writeErr != nil {
+				discardPreallocatedStaging(pool, fullPath, stagingPath)
 				return pendingFile{}, writeErr
 			}
 			offset += int64(n)
@@ -337,6 +364,7 @@ func processMoved(path, fullPath, srcPath string, fileSize uint64, pool *fswrite
 			break
 		}
 		if readErr != nil {
+			discardPreallocatedStaging(pool, fullPath, stagingPath)
 			return pendingFile{}, readErr
 		}
 	}
@@ -348,6 +376,7 @@ func processMoved(path, fullPath, srcPath string, fileSize uint64, pool *fswrite
 		path:        path,
 		fullPath:    fullPath,
 		stagingPath: stagingPath,
+		movedFrom:   srcPath,
 		reusedBytes: offset,
 	}, nil
 }
@@ -394,20 +423,25 @@ func processPatchEntry(path, fullPath string, entry rman.FileEntry, pool *fswrit
 		return pendingFile{}, nil, false, err
 	}
 
+	// 以下 Hits 复制阶段的任何错误都会先清理刚预分配的 staging：这批错误发生在
+	// 文件进入步骤 6 的提交/丢弃流程之前，不清理就会残留半成品 staging。
 	var reused int64
 	if result.Exists && len(result.Hits) > 0 {
 		old, err := os.Open(fullPath)
 		if err != nil {
+			discardPreallocatedStaging(pool, fullPath, stagingPath)
 			return pendingFile{}, nil, false, err
 		}
 		for _, hit := range result.Hits {
 			buf := make([]byte, hit.Chunk.UncompressedSize)
 			if _, err := old.ReadAt(buf, hit.FileOffset); err != nil {
 				old.Close()
+				discardPreallocatedStaging(pool, fullPath, stagingPath)
 				return pendingFile{}, nil, false, err
 			}
 			if _, err := pool.WriteAt(stagingPath, buf, hit.FileOffset); err != nil {
 				old.Close()
+				discardPreallocatedStaging(pool, fullPath, stagingPath)
 				return pendingFile{}, nil, false, err
 			}
 			reused += int64(hit.Chunk.UncompressedSize)
@@ -485,4 +519,20 @@ func removeDeleted(outputDir string, removed []string, d *core.Downloader, stats
 		d.Emit(core.EventFileRemoved{Path: fullPath})
 	}
 	return nil
+}
+
+// removeMovedSources 删除成功提交的 Moved 配对的旧路径（sources 为磁盘绝对路径，
+// 只包含步骤 6 里已经 CommitStaging 成功的配对——失败的配对从未被加入这份列表，
+// 天然满足"目标提交失败时不动源文件"的约束）。只删除常规文件，路径已不存在或
+// 不是常规文件（如目录、符号链接）时跳过，不视为错误；单个文件的删除失败是
+// 尽力而为，不阻塞其余路径，与 removeDeleted 的语义一致。这里不写 Stats.Removed、
+// 不发事件——旧路径不是 diff 判定的"删除"，只是 Moved 迁移后的重复副本。
+func removeMovedSources(sources []string) {
+	for _, src := range sources {
+		info, err := os.Lstat(src)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		_ = os.Remove(src)
+	}
 }

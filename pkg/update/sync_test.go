@@ -997,3 +997,200 @@ func TestSync_Auto_SkipsCorruptedUnchanged_RepairFixes(t *testing.T) {
 		t.Errorf("ModeRepair 后内容应修复为正确内容: got %q want %q", afterRepair, goodData)
 	}
 }
+
+// TestSync_Auto_Moved_SourceMissing_DiscardsStagingKeepsOthers 验证 Moved 在预分配
+// staging 之后、复制源内容之前就失败（旧路径已从磁盘消失）时：该文件计入
+// Stats.Failed 且新路径 staging 不残留、不生成最终文件；同批次里能正常提交的
+// Moved 文件不受影响，且 RemoveDeleted=true 时其旧路径按 Finding 2 的语义被删除；
+// installed.json 不推进。
+func TestSync_Auto_Moved_SourceMissing_DiscardsStagingKeepsOthers(t *testing.T) {
+	mock := newMockFetcher()
+	d, dir := newSyncTestDownloader(t, mock)
+
+	goodData := []byte("moved-source-exists-should-copy-and-source-removed")
+	goodChunk := makeSyncChunk(t, goodData, 0, 0)
+	writeFile(t, dir, "good-old.bin", goodData)
+
+	missingChunk := makeSyncChunk(t, []byte("moved-source-missing-content-declaration-only!!"), 0, 0)
+	// 故意不写 missing-old.bin：旧清单声明它存在，但 Sync 运行时磁盘上已经缺失。
+
+	oldSpecs := []oldFileSpec{
+		{path: "good-old.bin", chunkIDs: []uint64{goodChunk.info.ChunkID}},
+		{path: "missing-old.bin", chunkIDs: []uint64{missingChunk.info.ChunkID}},
+	}
+	oldManifestPath := writeOldManifestFile(t, dir, 0x3131313131313131, oldSpecs)
+
+	newFiles := []rman.FileEntry{
+		makeSyncFileEntry("good-new.bin", goodChunk),
+		makeSyncFileEntry("missing-new.bin", missingChunk),
+	}
+	newManifest := &rman.Manifest{ManifestID: 0x4141414141414141, Files: newFiles}
+
+	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: true}
+	stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, newFiles, d, opts)
+	if err != nil {
+		t.Fatalf("Sync 不应返回顶层 error（部分失败走 Stats.Failed）: %v", err)
+	}
+
+	if len(stats.Failed) != 1 || stats.Failed[0] != "missing-new.bin" {
+		t.Fatalf("Failed 期望 [missing-new.bin]，got %v", stats.Failed)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "missing-new.bin.rman-tmp")); !os.IsNotExist(statErr) {
+		t.Errorf("失败 Moved 文件的 staging 应已被丢弃, stat err=%v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "missing-new.bin")); !os.IsNotExist(statErr) {
+		t.Errorf("失败 Moved 文件不应生成最终文件, stat err=%v", statErr)
+	}
+	// 源路径本来就不存在，Sync 也不应该凭空创建它。
+	if _, statErr := os.Stat(filepath.Join(dir, "missing-old.bin")); !os.IsNotExist(statErr) {
+		t.Errorf("失败 Moved 文件的（本就缺失的）源路径不应被创建, stat err=%v", statErr)
+	}
+
+	if len(stats.Moved) != 1 || stats.Moved[0] != "good-new.bin" {
+		t.Fatalf("Moved 期望 [good-new.bin]，got %v", stats.Moved)
+	}
+	gotGood, err := os.ReadFile(filepath.Join(dir, "good-new.bin"))
+	if err != nil {
+		t.Fatalf("读取 good-new.bin 失败: %v", err)
+	}
+	if !bytes.Equal(gotGood, goodData) {
+		t.Errorf("good-new.bin 内容不匹配: got %q want %q", gotGood, goodData)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "good-old.bin")); !os.IsNotExist(statErr) {
+		t.Errorf("RemoveDeleted=true 时成功 Moved 的源路径应被删除, stat err=%v", statErr)
+	}
+
+	archive := NewArchive(dir)
+	if _, ok := archive.InstalledManifestPath(); ok {
+		t.Error("存在 Failed 文件时不应推进 installed.json")
+	}
+}
+
+// TestSync_Auto_Moved_RemoveDeletedTrue_DeletesSource 验证 Finding 2：RemoveDeleted=true
+// 时，成功提交的 Moved 配对的旧路径应被删除，新路径持有内容。
+func TestSync_Auto_Moved_RemoveDeletedTrue_DeletesSource(t *testing.T) {
+	mock := newMockFetcher()
+	d, dir := newSyncTestDownloader(t, mock)
+
+	data := []byte("moved-file-content-old-path-should-be-deleted!!")
+	chunk := makeSyncChunk(t, data, 0, 0)
+	writeFile(t, dir, "old-name.bin", data)
+
+	oldSpecs := []oldFileSpec{{path: "old-name.bin", chunkIDs: []uint64{chunk.info.ChunkID}}}
+	oldManifestPath := writeOldManifestFile(t, dir, 0x5151515151515151, oldSpecs)
+
+	newFiles := []rman.FileEntry{makeSyncFileEntry("new-name.bin", chunk)}
+	newManifest := &rman.Manifest{ManifestID: 0x6161616161616161, Files: newFiles}
+
+	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: true}
+	stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, newFiles, d, opts)
+	if err != nil {
+		t.Fatalf("Sync 失败: %v", err)
+	}
+	if len(stats.Moved) != 1 || stats.Moved[0] != "new-name.bin" {
+		t.Fatalf("Moved 期望 [new-name.bin]，got %v", stats.Moved)
+	}
+	if len(stats.Removed) != 0 {
+		t.Errorf("Moved 源清理不应计入 Stats.Removed，got %v", stats.Removed)
+	}
+
+	gotNew, err := os.ReadFile(filepath.Join(dir, "new-name.bin"))
+	if err != nil {
+		t.Fatalf("读取新路径失败: %v", err)
+	}
+	if !bytes.Equal(gotNew, data) {
+		t.Errorf("新路径内容不匹配: got %q want %q", gotNew, data)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "old-name.bin")); !os.IsNotExist(statErr) {
+		t.Errorf("RemoveDeleted=true 时旧路径应被删除, stat err=%v", statErr)
+	}
+}
+
+// TestSync_Auto_Moved_RemoveDeletedFalse_KeepsSource 验证 Finding 2：RemoveDeleted=false
+// 时，成功提交的 Moved 配对的旧路径应原样保留。
+func TestSync_Auto_Moved_RemoveDeletedFalse_KeepsSource(t *testing.T) {
+	mock := newMockFetcher()
+	d, dir := newSyncTestDownloader(t, mock)
+
+	data := []byte("moved-file-content-old-path-should-be-kept!!!!!")
+	chunk := makeSyncChunk(t, data, 0, 0)
+	writeFile(t, dir, "old-name.bin", data)
+
+	oldSpecs := []oldFileSpec{{path: "old-name.bin", chunkIDs: []uint64{chunk.info.ChunkID}}}
+	oldManifestPath := writeOldManifestFile(t, dir, 0x7171717171717171, oldSpecs)
+
+	newFiles := []rman.FileEntry{makeSyncFileEntry("new-name.bin", chunk)}
+	newManifest := &rman.Manifest{ManifestID: 0x8181818181818181, Files: newFiles}
+
+	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: false}
+	stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, newFiles, d, opts)
+	if err != nil {
+		t.Fatalf("Sync 失败: %v", err)
+	}
+	if len(stats.Moved) != 1 || stats.Moved[0] != "new-name.bin" {
+		t.Fatalf("Moved 期望 [new-name.bin]，got %v", stats.Moved)
+	}
+
+	gotOld, err := os.ReadFile(filepath.Join(dir, "old-name.bin"))
+	if err != nil {
+		t.Fatalf("RemoveDeleted=false 时旧路径应保留: %v", err)
+	}
+	if !bytes.Equal(gotOld, data) {
+		t.Errorf("旧路径内容被意外改动: got %q want %q", gotOld, data)
+	}
+}
+
+// TestSync_Auto_MissesAcrossTwoBundlesOneFails_WholeFileFailedStagingDiscarded 验证
+// Finding 3：单个文件的 Miss 分别落在两个不同 Bundle，其中一个 Bundle 下载失败、
+// 另一个成功——DownloadTasks 按文件聚合失败（一个 Job 失败即整份文件不可信），
+// 因此整个文件都应计入 Stats.Failed，其 staging 已丢弃，旧内容保持不变。
+func TestSync_Auto_MissesAcrossTwoBundlesOneFails_WholeFileFailedStagingDiscarded(t *testing.T) {
+	mock := newMockFetcher()
+	d, dir := newSyncTestDownloader(t, mock)
+
+	oldData := []byte("old-content-differs-from-both-new-chunks-must-survive")
+	oldChunk := makeSyncChunk(t, oldData, 0, 0)
+	writeFile(t, dir, "file.bin", oldData)
+
+	const bundleFail uint64 = 0x9100000000000001
+	const bundleOK uint64 = 0x9100000000000002
+	newC0 := makeSyncChunk(t, []byte("chunk-zero-lives-in-the-bundle-that-fails!!!!!!"), bundleFail, 0)
+	newC1 := makeSyncChunk(t, []byte("chunk-one-lives-in-the-bundle-that-succeeds!!!!"), bundleOK, 0)
+	mock.failBundles[core.BundleFilename(bundleFail)] = true
+	mock.addChunk(newC1.info.ChunkID, bundleOK, newC1.info.BundleOffset, newC1.compressed)
+
+	oldSpecs := []oldFileSpec{{path: "file.bin", chunkIDs: []uint64{oldChunk.info.ChunkID}}}
+	oldManifestPath := writeOldManifestFile(t, dir, 0xA1A1A1A1A1A1A1A1, oldSpecs)
+
+	newFiles := []rman.FileEntry{makeSyncFileEntry("file.bin", newC0, newC1)}
+	newManifest := &rman.Manifest{ManifestID: 0xB1B1B1B1B1B1B1B1, Files: newFiles}
+
+	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: true}
+	stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, newFiles, d, opts)
+	if err != nil {
+		t.Fatalf("Sync 不应返回顶层 error（部分失败走 Stats.Failed）: %v", err)
+	}
+
+	if len(stats.Failed) != 1 || stats.Failed[0] != "file.bin" {
+		t.Fatalf("Failed 期望 [file.bin]，got %v", stats.Failed)
+	}
+	if len(stats.Patched) != 0 || len(stats.Created) != 0 {
+		t.Errorf("file.bin 不应出现在 Patched/Created，got Patched=%v Created=%v", stats.Patched, stats.Created)
+	}
+
+	gotOld, err := os.ReadFile(filepath.Join(dir, "file.bin"))
+	if err != nil {
+		t.Fatalf("读取 file.bin 失败: %v", err)
+	}
+	if !bytes.Equal(gotOld, oldData) {
+		t.Errorf("旧内容应保持不变: got %q want %q", gotOld, oldData)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "file.bin.rman-tmp")); !os.IsNotExist(statErr) {
+		t.Errorf("staging 应已被丢弃, stat err=%v", statErr)
+	}
+
+	archive := NewArchive(dir)
+	if _, ok := archive.InstalledManifestPath(); ok {
+		t.Error("存在 Failed 文件时不应推进 installed.json")
+	}
+}

@@ -7,11 +7,16 @@ import (
 	"strings"
 )
 
-// outputPath resolves a manifest file path under outputDir and rejects
+// OutputPath resolves a manifest file path under outputDir and rejects
 // absolute paths, parent-directory traversal, Windows drive/ADS syntax, and
 // empty path elements that could escape or alias the output root on different
 // platforms.
-func outputPath(outputDir, manifestPath string) (string, error) {
+//
+// Exported so pkg/update.Sync can resolve the same outputDir-relative target
+// paths as the downloader (staging/verify/moved/removed all need the exact
+// same path-safety rules); keeping one implementation avoids two independently
+// maintained copies of security-relevant path validation.
+func OutputPath(outputDir, manifestPath string) (string, error) {
 	if manifestPath == "" {
 		return "", fmt.Errorf("manifest path is empty")
 	}

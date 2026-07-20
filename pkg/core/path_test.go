@@ -8,14 +8,14 @@ import (
 
 func TestOutputPathAcceptsSafeManifestPath(t *testing.T) {
 	root := t.TempDir()
-	got, err := outputPath(root, "RADS/solutions/file.bin")
+	got, err := OutputPath(root, "RADS/solutions/file.bin")
 	if err != nil {
-		t.Fatalf("outputPath returned error for safe path: %v", err)
+		t.Fatalf("OutputPath returned error for safe path: %v", err)
 	}
 
 	want := filepath.Join(root, "RADS", "solutions", "file.bin")
 	if got != want {
-		t.Fatalf("outputPath = %q, want %q", got, want)
+		t.Fatalf("OutputPath = %q, want %q", got, want)
 	}
 }
 
@@ -33,8 +33,8 @@ func TestOutputPathRejectsTraversalAndPlatformSpecificEscapes(t *testing.T) {
 
 	for _, p := range unsafePaths {
 		t.Run(strings.ReplaceAll(p, "/", "_"), func(t *testing.T) {
-			if got, err := outputPath(root, p); err == nil {
-				t.Fatalf("outputPath(%q) = %q, want error", p, got)
+			if got, err := OutputPath(root, p); err == nil {
+				t.Fatalf("OutputPath(%q) = %q, want error", p, got)
 			}
 		})
 	}

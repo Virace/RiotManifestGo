@@ -117,6 +117,14 @@ func (d *Downloader) emit(event DownloadEvent) {
 	}
 }
 
+// Emit 向 Downloader 的事件 channel 发出一个事件，供包外的上层编排逻辑
+// （如 pkg/update.Sync）复用同一条事件流，与下载管线自身发出的事件交织在一起，
+// 便于消费方（CLI）只订阅一个 Events() channel 就能拿到完整的进度信息。
+// 语义与内部 emit 完全一致：channel 已满时丢弃事件而不阻塞。
+func (d *Downloader) Emit(event DownloadEvent) {
+	d.emit(event)
+}
+
 // Download 执行完整的下载流程：预分配 staging → Mapper → DownloadTasks（自管 staging）。
 //
 // 对外签名与语义与重构前一致：接收完整文件列表，内部据此下载全部 Chunk 并在成功
@@ -228,6 +236,13 @@ func (d *Downloader) DownloadTasks(ctx context.Context, taskMap map[uint64][]Glo
 		if err := d.finalizeStaging(taskMap, failed); err != nil {
 			return failed, err
 		}
+	} else {
+		// 调用方（如增量更新编排器）接下来可能要立即对这些 staging 路径执行
+		// rename/remove：Windows 下这要求句柄已释放，因此即便不提交/不丢弃，
+		// 也必须在返回前关闭这批任务涉及的全部 staging 句柄。
+		if err := d.closeStagingHandles(taskMap); err != nil {
+			return failed, err
+		}
 	}
 
 	if len(failed) > 0 {
@@ -242,7 +257,58 @@ func (d *Downloader) DownloadTasks(ctx context.Context, taskMap map[uint64][]Glo
 // 旧文件，删除半成品 staging）。ClosePath 必须先于 rename/remove 调用——Windows
 // 下无法对仍持有打开句柄的文件执行这两个操作。
 func (d *Downloader) finalizeStaging(taskMap map[uint64][]GlobalChunkTask, failed map[string]bool) error {
+	for _, filePath := range taskMapFilePaths(taskMap) {
+		fullPath, err := OutputPath(d.config.OutputDir, filePath)
+		if err != nil {
+			return err
+		}
+		stagingPath := fswriter.StagingPath(fullPath)
+
+		if err := d.filePool.ClosePath(stagingPath); err != nil {
+			return fmt.Errorf("关闭暂存文件句柄失败 %s: %w", stagingPath, err)
+		}
+
+		if failed[filePath] {
+			if err := fswriter.DiscardStaging(fullPath); err != nil {
+				return fmt.Errorf("丢弃暂存文件失败 %s: %w", fullPath, err)
+			}
+			continue
+		}
+
+		if err := fswriter.CommitStaging(fullPath); err != nil {
+			return fmt.Errorf("提交暂存文件失败 %s: %w", fullPath, err)
+		}
+		d.emit(EventFileRenamed{From: stagingPath, To: fullPath})
+	}
+	return nil
+}
+
+// closeStagingHandles 关闭 taskMap 涉及的全部目标文件在 FilePool 中残留的 staging
+// 句柄，既不提交也不丢弃——用于 ManageStaging=false 场景：staging 的提交/丢弃归调用方
+// 负责，但 FilePool 是 Downloader 私有的，调用方无法自行关闭 DownloadTasks 内部
+// WriteAt 时打开的句柄，只能由 DownloadTasks 自己在返回前释放。路径从未被 FilePool
+// 打开过时 ClosePath 是安全的空操作（如 Gap Tolerance 之外、CompressedSize=0 被
+// mergeRanges 过滤掉、从未触发 WriteAt 的目标文件）。
+func (d *Downloader) closeStagingHandles(taskMap map[uint64][]GlobalChunkTask) error {
+	for _, filePath := range taskMapFilePaths(taskMap) {
+		fullPath, err := OutputPath(d.config.OutputDir, filePath)
+		if err != nil {
+			return err
+		}
+		stagingPath := fswriter.StagingPath(fullPath)
+		if err := d.filePool.ClosePath(stagingPath); err != nil {
+			return fmt.Errorf("关闭暂存文件句柄失败 %s: %w", stagingPath, err)
+		}
+	}
+	return nil
+}
+
+// taskMapFilePaths 返回 taskMap 涉及的全部目标文件 FilePath（去重，即
+// WriteTarget.FilePath，清单相对路径而非磁盘绝对路径），供 finalizeStaging 与
+// closeStagingHandles 共用同一套遍历/去重逻辑。
+func taskMapFilePaths(taskMap map[uint64][]GlobalChunkTask) []string {
 	seen := make(map[string]bool)
+	paths := make([]string, 0, len(taskMap))
 	for _, tasks := range taskMap {
 		for _, task := range tasks {
 			for _, target := range task.Targets {
@@ -250,32 +316,11 @@ func (d *Downloader) finalizeStaging(taskMap map[uint64][]GlobalChunkTask, faile
 					continue
 				}
 				seen[target.FilePath] = true
-
-				fullPath, err := outputPath(d.config.OutputDir, target.FilePath)
-				if err != nil {
-					return err
-				}
-				stagingPath := fswriter.StagingPath(fullPath)
-
-				if err := d.filePool.ClosePath(stagingPath); err != nil {
-					return fmt.Errorf("关闭暂存文件句柄失败 %s: %w", stagingPath, err)
-				}
-
-				if failed[target.FilePath] {
-					if err := fswriter.DiscardStaging(fullPath); err != nil {
-						return fmt.Errorf("丢弃暂存文件失败 %s: %w", fullPath, err)
-					}
-					continue
-				}
-
-				if err := fswriter.CommitStaging(fullPath); err != nil {
-					return fmt.Errorf("提交暂存文件失败 %s: %w", fullPath, err)
-				}
-				d.emit(EventFileRenamed{From: stagingPath, To: fullPath})
+				paths = append(paths, target.FilePath)
 			}
 		}
 	}
-	return nil
+	return paths
 }
 
 // jobFilePaths 返回 job 覆盖到的全部目标文件的 FilePath（去重，即 WriteTarget.FilePath，
@@ -304,7 +349,7 @@ func (d *Downloader) preallocateFiles(ctx context.Context, files []rman.FileEntr
 		if f.FileSize == 0 {
 			continue
 		}
-		fullPath, err := outputPath(d.config.OutputDir, f.Path)
+		fullPath, err := OutputPath(d.config.OutputDir, f.Path)
 		if err != nil {
 			return err
 		}
@@ -452,7 +497,7 @@ func (d *Downloader) processBundle(ctx context.Context, job BundleJob) error {
 			}
 
 			for _, target := range task.Targets {
-				fullPath, pathErr := outputPath(d.config.OutputDir, target.FilePath)
+				fullPath, pathErr := OutputPath(d.config.OutputDir, target.FilePath)
 				if pathErr != nil {
 					return pathErr
 				}

@@ -844,6 +844,67 @@ func TestDownloadTasksNoStagingManagement(t *testing.T) {
 	}
 }
 
+// TestDownloadTasksNoStagingManagementReleasesHandlesForCallerRename 验证
+// ManageStaging=false 时，DownloadTasks 返回前会释放它在处理过程中于 FilePool
+// 打开的 staging 句柄：调用方（增量更新编排器）紧随其后对同一 staging 路径执行
+// os.Rename 必须成功——Windows 下对仍被打开的文件 rename 会失败，这是本测试
+// 要固化的跨平台行为。
+func TestDownloadTasksNoStagingManagementReleasesHandlesForCallerRename(t *testing.T) {
+	config, dir := makeTestConfig(t)
+
+	const bundleID uint64 = 0x5000000000000001
+	data := []byte("handle must be released before DownloadTasks(false) returns")
+	chunk := makeTestChunk(t, data, bundleID, 0)
+	file := makeTestFileEntry("release/target.bin", chunk)
+
+	taskMap := Map([]rman.FileEntry{file})
+
+	mock := newMockFetcher()
+	setupMockResponse(t, mock, bundleID, chunk)
+
+	dl := NewDownloaderWithFetcher(config, mock)
+	defer dl.filePool.Close()
+	events := dl.Events()
+	var eventWg sync.WaitGroup
+	eventWg.Add(1)
+	go func() {
+		defer eventWg.Done()
+		for range events {
+		}
+	}()
+
+	targetPath := filepath.Join(dir, "release", "target.bin")
+	stagingPath := fswriter.StagingPath(targetPath)
+	if err := dl.filePool.PreallocateFile(stagingPath, int64(len(data))); err != nil {
+		t.Fatalf("PreallocateFile 失败: %v", err)
+	}
+
+	failed, err := dl.DownloadTasks(context.Background(), taskMap, TaskOptions{ManageStaging: false})
+	close(dl.events)
+	eventWg.Wait()
+
+	if err != nil {
+		t.Fatalf("DownloadTasks 失败: %v", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("failed 集合应为空，实际: %v", failed)
+	}
+
+	// 调用方在此处自行提交 staging（模拟 pkg/update.Sync 的第 6 步）：
+	// 若 DownloadTasks 没有释放句柄，Windows 下这一步会失败。
+	if err := os.Rename(stagingPath, targetPath); err != nil {
+		t.Fatalf("DownloadTasks(false) 返回后调用方 rename staging 失败（句柄未释放）: %v", err)
+	}
+
+	content, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("读取提交后的目标文件失败: %v", err)
+	}
+	if !bytes.Equal(content, data) {
+		t.Errorf("提交后内容不匹配: got %q, want %q", content, data)
+	}
+}
+
 // TestDownloadWritesStagingAndCommits 验证既有 Download 路径下 staging 的提交时机：
 // 目标旧文件在全部作业完成之前字节必须保持不变（写入只落 staging），只有全部作业
 // 成功后才会被原子替换为新内容。

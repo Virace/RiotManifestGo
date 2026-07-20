@@ -10,6 +10,8 @@ Riot 游戏资源清单（RMAN / `.manifest`）解析与下载工具的 Go 实�
 - **灵活筛选**：支持路径匹配（子串/正则）和 Flags 过滤（语言/平台）
 - **高速并发下载**：多 Worker 并行，HTTP Range 合并，ZSTD 流式解压
 - **哈希校验**：支持 SHA256、SHA512、HKDF、Blake3 四种校验算法
+- **增量更新**：自动发现本地存档，按 chunk 级校验只下载新旧清单间真正变化的部分，未变化文件整个跳过、未变化数据本地复用
+- **原子写盘**：下载与本地修复统一先写临时文件、完成后原子替换，中断不会损坏已有文件
 - **纯 Go 实现**：无 CGO 依赖，交叉编译友好
 
 ## 快速开始
@@ -44,6 +46,30 @@ go build -o manifest-cli ./cmd/manifest-cli/
 ./manifest-cli game.manifest -p "\.dll" -o ./output -u https://cdn.example.com/bundles -log download.log
 ```
 
+### 增量更新
+
+`-o` 指向的输出目录下若已有上一次成功更新留下的本地存档（`.rman/` 目录，见下文），再次运行会自动按增量模式工作，无需任何额外参数；也可以显式指定旧清单路径。
+
+```bash
+# 增量更新：自动从本地存档发现旧版本，只下载真正变化的内容
+./manifest-cli new.manifest -o ./output
+
+# 显式指定旧清单（忽略本地存档）
+./manifest-cli new.manifest -o ./output -update old.manifest
+
+# 只校验本地文件完整性，不下载、不写盘；退出码非零表示存在待修复文件
+./manifest-cli game.manifest -o ./output -verify-only
+
+# 修复模式：逐文件重新校验，补齐本地缺失/损坏的内容（不做文件级跳过）
+./manifest-cli game.manifest -o ./output -repair
+
+# 强制全量：跳过一切校验，把匹配文件当作全新内容整体下载
+./manifest-cli game.manifest -o ./output -no-verify
+
+# 保留旧清单中已不存在的文件，不做默认的清理
+./manifest-cli new.manifest -o ./output -keep-removed
+```
+
 ## 参数
 
 | 参数 | 说明 | 默认值 |
@@ -60,6 +86,61 @@ go build -o manifest-cli ./cmd/manifest-cli/
 | `-v` | 输出等级（0=进度条, 1-3=递增详细度） | `0` |
 | `-log` | 保存下载日志 | - |
 | `-retry` | Bundle 下载失败最大重试次数 | `3` |
+| `-update` | 旧清单路径，用于增量更新比对（缺省时自动从本地存档发现） | - |
+| `-repair` | 修复模式：逐文件重新校验并补齐本地缺失/损坏的内容，不做文件级跳过 | `false` |
+| `-verify-only` | 仅校验本地文件完整性，不下载、不写盘 | `false` |
+| `-no-verify` | 跳过校验，将全部匹配文件当作全新内容整体下载 | `false` |
+| `-keep-removed` | 保留旧清单中已不存在的文件，不清理磁盘（默认清理） | `false` |
+
+`-repair`、`-verify-only`、`-no-verify` 两两互斥，同时指定多个会报错退出。
+
+## 更新模式
+
+无论是否携带旧清单，下载、修复、更新走的都是同一条管线，没有单独的"更新"子命令：
+
+| 本地状态 | 行为 |
+|---|---|
+| 目标文件在本地不存在 | 全量下载 |
+| 目标文件在本地已存在 | 按新清单的 chunk 布局逐块校验，仅补齐缺失或损坏的部分 |
+| 存在旧清单（`-update` 显式指定，或从 `.rman/installed.json` 自动发现） | 额外做一层文件级跳过：路径与 chunk 序列都未变化的文件整个跳过，不做任何 IO |
+
+四种模式（互不重叠的 CLI flag，行为差异如下）：
+
+| 模式 | 文件级跳过 | 本地内容校验 | 下载/写盘 | 适用场景 |
+|---|---|---|---|---|
+| 默认（不加 flag） | 有旧清单时启用 | 仅对未被跳过的文件做 chunk 级校验补洞 | 只有变化的内容才下载写盘 | 日常增量更新 |
+| `-repair` | 关闭 | 全部匹配文件逐一做 chunk 级校验补洞 | 仅缺失/损坏的部分下载写盘 | 怀疑本地文件损坏，包括被默认模式跳过的未变化文件 |
+| `-verify-only` | 关闭 | 全部匹配文件逐一做 chunk 级校验 | 不下载、不写盘（dry-run） | 只检查本地完整性；退出码非零表示存在待修复文件 |
+| `-no-verify` | 关闭 | 不校验 | 全部匹配文件当作全新内容整体下载 | 强制全量重新下载，跳过校验开销 |
+
+## 本地状态目录（.rman/）
+
+每次更新成功后，程序会在输出目录下维护一个 `.rman/` 状态目录，作为下一次增量更新的比对基准：
+
+```
+<output>/.rman/
+├── installed.json                       # 当前安装状态
+└── manifests/
+    └── <ManifestID:016X>.manifest       # 清单原始字节存档（保留当前 + 上一份）
+```
+
+`installed.json` 示例：
+
+```json
+{
+  "schema": 1,
+  "manifest_id": "037EC59D5BD7C5D3",
+  "manifest_file": "manifests/037EC59D5BD7C5D3.manifest",
+  "source": "https://lol.secure.dyn.riotcdn.net/channels/public/releases/037EC59D5BD7C5D3.manifest",
+  "updated_at": "2026-07-18T12:00:00Z"
+}
+```
+
+该文件格式（含字段名、`manifests/` 相对路径中的正斜杠、`updated_at` 的 UTC RFC3339 时间格式）与姊妹 Python 项目共享，属于跨语言数据契约，不应手工修改；`schema` 用于标识格式版本，无法识别的 `schema` 会被当作没有可用状态处理，退化为全量更新。只有整批更新全部成功时才会推进这份状态；中途失败不会写入半新不旧的版本记录。
+
+### 临时文件与磁盘占用
+
+每个目标文件在写入前都会先落地为同目录下的 `<文件名>.rman-tmp` 临时文件，待该文件全部内容就绪后再原子替换正式文件；替换完成前，旧文件始终保持完整、可读。因此一次更新过程中额外占用的磁盘空间峰值，约等于本次改动涉及的**单个最大文件**的大小，而不是全部待更新文件大小之和。
 
 ## 架构
 
@@ -67,9 +148,11 @@ go build -o manifest-cli ./cmd/manifest-cli/
 cmd/manifest-cli/     CLI 入口
 pkg/rman/             RMAN 解析器（FlatBuffers + ZSTD）
 pkg/core/             调度核心（Filter → Map → Schedule → Download）
+pkg/diff/             新旧清单差分（ChunkID 序列判同）
+pkg/update/           增量更新编排、本地 chunk 校验、清单存档与 installed.json
 internal/zstream/     ZSTD 解压 + 哈希校验
 internal/netpool/     HTTP Range 客户端
-internal/fswriter/    LRU 文件句柄池
+internal/fswriter/    LRU 文件句柄池、staging 原子替换
 ```
 
 ## 依赖

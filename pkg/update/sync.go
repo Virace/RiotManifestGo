@@ -85,8 +85,13 @@ type pendingFile struct {
 // Sync 是增量更新编排器：比较新旧清单、按 chunk 级复用本地数据、把缺失的 chunk
 // 灌入 Downloader 完成网络补洞，最后统一提交并（成功时）推进 installed.json。
 //
-// files 是调用方传入的完整待处理文件集合（通常已经过 core.Filter），newManifest/
-// rawManifest/source 只用于成功后的 Archive.Save（新清单存档）。
+// files 是本次调用实际要处理的文件子集（通常已经过 core.Filter，可能小于完整
+// 新清单）。newManifest.Files 是完整新清单条目：ModeAuto 下 resolveDiff 用它
+// （而不是 files）与旧清单一起算完整 diff，再按 files 收窄到本次处理范围——
+// 这样旧清单里过滤范围外、但完整新清单仍然声明的路径，既不会被误判为
+// diff.Result.Removed（RemoveDeleted=true 时被误删），也不会被误配对成某个
+// 过滤内 Added 条目的 Moved 源（同样导致误删）。rawManifest/source 只用于成功
+// 后的 Archive.Save，存档的是完整新清单，与 files 的过滤范围无关。
 func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, source string,
 	outputDir string, files []rman.FileEntry, d *core.Downloader, opts Options) (Stats, error) {
 
@@ -94,7 +99,7 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 		return Stats{}, err
 	}
 
-	diffResult, err := resolveDiff(outputDir, files, opts)
+	diffResult, err := resolveDiff(outputDir, newManifest, files, opts)
 	if err != nil {
 		return Stats{}, err
 	}
@@ -253,15 +258,21 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 
 // resolveDiff 按 opts.Mode 决定 diff.Result：
 //   - ModeAuto：opts.OldManifestPath 优先，否则尝试 Archive 自动发现；找到则
-//     rman.ParseFile + diff.Diff。显式指定的路径解析失败视为硬错误（用户明确
-//     要求了某个旧清单，不能默默忽略）；自动发现的路径解析失败退化为"无旧清单"
-//     （那只是内部存档缓存，不应让它的损坏拖垮整次 Sync）。完全没有旧清单时，
-//     把全部新文件视为 Changed（Spec §7："Unchanged 默认不验证——不带旧清单跑
-//     一次即得全量验证"），Unchanged/Added/Moved/Removed 均为空。
-//   - ModeRepair/ModeVerifyOnly：不解析旧清单、不做 diff，全部视为 Changed
+//     rman.ParseFile + diff.Diff(oldManifest.Files, newManifest.Files)——用完整
+//     新旧清单算 diff，而不是 files（本次调用实际要处理的子集，通常是 CLI
+//     -p/-f 过滤后的结果）。只用过滤子集做 diff 会让旧清单里过滤范围外、但完整
+//     新清单仍然声明的路径被误判为 Removed（RemoveDeleted=true 时被误删），也
+//     可能被误配对成某个过滤内 Added 条目的 Moved 源（同样导致误删）。算出完整
+//     diff 后再用 filterDiffResult 按 files 收窄到本次实际要处理的范围。显式
+//     指定的路径解析失败视为硬错误（用户明确要求了某个旧清单，不能默默忽略）；
+//     自动发现的路径解析失败退化为"无旧清单"（那只是内部存档缓存，不应让它的
+//     损坏拖垮整次 Sync）。完全没有旧清单时，把 files 全部视为 Changed
+//     （Spec §7："Unchanged 默认不验证——不带旧清单跑一次即得全量验证"），
+//     Unchanged/Added/Moved/Removed 均为空。
+//   - ModeRepair/ModeVerifyOnly：不解析旧清单、不做 diff，files 全部视为 Changed
 //     （Spec §3 经验 1：不做文件级跳过）。
-//   - ModeForceFull：不解析旧清单，全部视为 Added（对应"跳过验证、整体重下"）。
-func resolveDiff(outputDir string, files []rman.FileEntry, opts Options) (diff.Result, error) {
+//   - ModeForceFull：不解析旧清单，files 全部视为 Added（对应"跳过验证、整体重下"）。
+func resolveDiff(outputDir string, newManifest *rman.Manifest, files []rman.FileEntry, opts Options) (diff.Result, error) {
 	switch opts.Mode {
 	case ModeRepair, ModeVerifyOnly:
 		return diff.Result{Changed: files}, nil
@@ -289,7 +300,52 @@ func resolveDiff(outputDir string, files []rman.FileEntry, opts Options) (diff.R
 		return diff.Result{Changed: files}, nil
 	}
 
-	return diff.Diff(oldManifest.Files, files), nil
+	full := diff.Diff(oldManifest.Files, newManifest.Files)
+	return filterDiffResult(full, files), nil
+}
+
+// filterDiffResult 把基于完整新旧清单算出的 full 差分结果，按 files（本次调用
+// 实际要处理的子集，通常是 CLI -p/-f 过滤后的结果）收窄范围：
+//   - Unchanged/Changed/Added：只保留 Path 命中 files 的条目。
+//   - Moved：只保留 Entry.Path（新路径）命中 files 的配对；新路径不在本次处理
+//     范围内的配对整体丢弃——既不复制内容，其旧路径也不会被当作"迁移源"清理。
+//   - Removed：直接采用 full 的判定结果（旧清单声明过、完整新清单已不再声明），
+//     额外防御性排除 files 命中的路径。正常情况下二者不会相交——一个 Path 不可能
+//     既是"完整新清单已不存在"又同时出现在 files（files 的元素必然来自完整新
+//     清单），这里的排除只是防御，不依赖它也能保证正确性。
+func filterDiffResult(full diff.Result, files []rman.FileEntry) diff.Result {
+	target := make(map[string]bool, len(files))
+	for _, f := range files {
+		target[f.Path] = true
+	}
+
+	var filtered diff.Result
+	for _, e := range full.Unchanged {
+		if target[e.Path] {
+			filtered.Unchanged = append(filtered.Unchanged, e)
+		}
+	}
+	for _, e := range full.Changed {
+		if target[e.Path] {
+			filtered.Changed = append(filtered.Changed, e)
+		}
+	}
+	for _, e := range full.Added {
+		if target[e.Path] {
+			filtered.Added = append(filtered.Added, e)
+		}
+	}
+	for _, pair := range full.Moved {
+		if target[pair.Entry.Path] {
+			filtered.Moved = append(filtered.Moved, pair)
+		}
+	}
+	for _, path := range full.Removed {
+		if !target[path] {
+			filtered.Removed = append(filtered.Removed, path)
+		}
+	}
+	return filtered
 }
 
 // verifyOnlySync 实现 ModeVerifyOnly：对 entries 逐一 VerifyFileChunks，零写盘、

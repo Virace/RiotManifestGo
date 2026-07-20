@@ -20,8 +20,8 @@ import (
 
 // ---- 最小 RMAN FlatBuffers 编码器（仅测试使用） ----
 //
-// Sync 对"旧清单"的消费只经由 diff.Diff(old.Files, files)，只依赖每个
-// FileEntry 的 Path 与 Chunks[].ChunkID 序列；旧内容的实际验证读取走磁盘上
+// Sync 对"旧清单"的消费只经由 diff.Diff(old.Files, newManifest.Files)，只依赖
+// 每个 FileEntry 的 Path 与 Chunks[].ChunkID 序列；旧内容的实际验证读取走磁盘上
 // 现存的文件，而不是旧清单本身。因此这里的编码器只需要保证 Path 与 ChunkID
 // 序列正确，其余字段（bundle_id、compressed_size、directory 等）用占位值即可，
 // 不需要还原 pkg/rman 解析器所支持的全部特性（Language/Directory/Parameters）。
@@ -1192,5 +1192,148 @@ func TestSync_Auto_MissesAcrossTwoBundlesOneFails_WholeFileFailedStagingDiscarde
 	archive := NewArchive(dir)
 	if _, ok := archive.InstalledManifestPath(); ok {
 		t.Error("存在 Failed 文件时不应推进 installed.json")
+	}
+}
+
+// ---- C1 回归测试：过滤运行下必须按完整清单差分，不能用过滤子集当"新清单" ----
+//
+// 背景（终审 finding C1）：resolveDiff 曾经用 diff.Diff(oldManifest.Files, files)
+// 计算差分，其中 files 是 CLI -p/-f 过滤后的处理子集。旧清单里过滤范围外的路径
+// 在这份"新清单"里天然找不到匹配，会被 diff.Diff 判为 Removed（或被误配对成某个
+// 过滤内 Added 条目的 Moved 源），RemoveDeleted=true 时二者都会导致磁盘上仍被
+// 完整新清单声明的文件被误删。修复后 resolveDiff 改用完整的
+// diff.Diff(oldManifest.Files, newManifest.Files)，再按 files 收窄处理范围。
+
+// TestSync_Auto_FilteredRun_RemovedFromCompleteDiff_KeepsOutOfFilterFiles 验证
+// Removed 判定必须来自完整新旧清单的 diff：过滤范围外但完整新清单仍然声明的
+// ahri.bin 不应被删除；真正被完整新清单移除的 legacy-old.bin 仍应被删除；
+// 过滤范围内的 aatrox.bin 正常按 chunk 级补洞更新。
+func TestSync_Auto_FilteredRun_RemovedFromCompleteDiff_KeepsOutOfFilterFiles(t *testing.T) {
+	mock := newMockFetcher()
+	d, dir := newSyncTestDownloader(t, mock)
+
+	aatroxOldData := []byte("aatrox-old-content-should-be-patched-by-filtered-run!")
+	aatroxOldChunk := makeSyncChunk(t, aatroxOldData, 0, 0)
+	const bundleID uint64 = 0xC100000000000001
+	aatroxNewData := []byte("aatrox-new-content-after-filtered-run-completes!!!!!!")
+	aatroxNewChunk := makeSyncChunk(t, aatroxNewData, bundleID, 0)
+	mock.addChunk(aatroxNewChunk.info.ChunkID, bundleID, aatroxNewChunk.info.BundleOffset, aatroxNewChunk.compressed)
+
+	ahriData := []byte("ahri-unchanged-out-of-filter-content-must-not-be-touched")
+	ahriChunk := makeSyncChunk(t, ahriData, 0, 0)
+
+	legacyData := []byte("legacy-content-genuinely-removed-from-new-manifest!!!")
+	legacyChunk := makeSyncChunk(t, legacyData, 0, 0)
+
+	writeFile(t, dir, "aatrox.bin", aatroxOldData)
+	writeFile(t, dir, "ahri.bin", ahriData)
+	writeFile(t, dir, "legacy-old.bin", legacyData)
+
+	oldSpecs := []oldFileSpec{
+		{path: "aatrox.bin", chunkIDs: []uint64{aatroxOldChunk.info.ChunkID}},
+		{path: "ahri.bin", chunkIDs: []uint64{ahriChunk.info.ChunkID}},
+		{path: "legacy-old.bin", chunkIDs: []uint64{legacyChunk.info.ChunkID}},
+	}
+	oldManifestPath := writeOldManifestFile(t, dir, 0xC1C1C1C1C1C1C1C1, oldSpecs)
+
+	// 完整新清单：legacy-old.bin 已不再声明（真正的 Removed），ahri.bin 原样保留。
+	allNewFiles := []rman.FileEntry{
+		makeSyncFileEntry("aatrox.bin", aatroxNewChunk),
+		makeSyncFileEntry("ahri.bin", ahriChunk),
+	}
+	newManifest := &rman.Manifest{ManifestID: 0xC2C2C2C2C2C2C2C2, Files: allNewFiles}
+
+	// 模拟 CLI "-p aatrox" 过滤后只剩 aatrox.bin 需要处理。
+	filteredFiles := []rman.FileEntry{allNewFiles[0]}
+
+	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: true}
+	stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, filteredFiles, d, opts)
+	if err != nil {
+		t.Fatalf("Sync 失败: %v", err)
+	}
+	if len(stats.Failed) != 0 {
+		t.Fatalf("Failed 应为空: %v", stats.Failed)
+	}
+
+	gotAhri, err := os.ReadFile(filepath.Join(dir, "ahri.bin"))
+	if err != nil {
+		t.Fatalf("过滤外文件 ahri.bin 被误删（C1 复现）: %v", err)
+	}
+	if !bytes.Equal(gotAhri, ahriData) {
+		t.Errorf("ahri.bin 内容被意外改动: got %q want %q", gotAhri, ahriData)
+	}
+
+	if _, statErr := os.Stat(filepath.Join(dir, "legacy-old.bin")); !os.IsNotExist(statErr) {
+		t.Errorf("legacy-old.bin 应被删除（完整新清单已不声明）, stat err=%v", statErr)
+	}
+
+	gotAatrox, err := os.ReadFile(filepath.Join(dir, "aatrox.bin"))
+	if err != nil {
+		t.Fatalf("读取 aatrox.bin 失败: %v", err)
+	}
+	if !bytes.Equal(gotAatrox, aatroxNewData) {
+		t.Errorf("aatrox.bin 未按新清单更新: got %q want %q", gotAatrox, aatroxNewData)
+	}
+
+	if len(stats.Removed) != 1 || stats.Removed[0] != "legacy-old.bin" {
+		t.Errorf("Stats.Removed 期望仅 [legacy-old.bin]，got %v", stats.Removed)
+	}
+}
+
+// TestSync_Auto_FilteredRun_MovedMispairingGuard_KeepsDeclaredOldPath 验证 Moved
+// 配对必须基于完整新旧清单：shared-data.bin 在完整新清单里原路径原样保留，
+// 不应该因为过滤子集里恰好只有 new-champ.bin（与它 ChunkID 序列相同）而被误判
+// 为 new-champ.bin 的 Moved 源——否则 RemoveDeleted=true 时 shared-data.bin 会被
+// 当作"迁移后的重复副本"删除，而它其实是完整新清单仍需要的正式内容。
+func TestSync_Auto_FilteredRun_MovedMispairingGuard_KeepsDeclaredOldPath(t *testing.T) {
+	mock := newMockFetcher()
+	d, dir := newSyncTestDownloader(t, mock)
+
+	const bundleID uint64 = 0xC300000000000001
+	sharedData := []byte("shared-content-declared-at-same-path-in-both-manifests!")
+	sharedChunk := makeSyncChunk(t, sharedData, bundleID, 0)
+	mock.addChunk(sharedChunk.info.ChunkID, bundleID, sharedChunk.info.BundleOffset, sharedChunk.compressed)
+
+	writeFile(t, dir, "shared-data.bin", sharedData)
+	// 故意不预先写 new-champ.bin：它是过滤范围内的新增文件，内容靠校验命中或
+	// 下载补齐都可以，测试不关心具体走哪条路径。
+
+	oldSpecs := []oldFileSpec{
+		{path: "shared-data.bin", chunkIDs: []uint64{sharedChunk.info.ChunkID}},
+	}
+	oldManifestPath := writeOldManifestFile(t, dir, 0xC4C4C4C4C4C4C4C4, oldSpecs)
+
+	allNewFiles := []rman.FileEntry{
+		makeSyncFileEntry("shared-data.bin", sharedChunk), // 完整新清单在原路径原样保留，未变化
+		makeSyncFileEntry("new-champ.bin", sharedChunk),   // 过滤内新增，ChunkID 序列与 shared-data.bin 相同
+	}
+	newManifest := &rman.Manifest{ManifestID: 0xC5C5C5C5C5C5C5C5, Files: allNewFiles}
+
+	// 模拟 CLI 过滤后只剩 new-champ.bin 需要处理。
+	filteredFiles := []rman.FileEntry{allNewFiles[1]}
+
+	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: true}
+	stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, filteredFiles, d, opts)
+	if err != nil {
+		t.Fatalf("Sync 失败: %v", err)
+	}
+	if len(stats.Failed) != 0 {
+		t.Fatalf("Failed 应为空: %v", stats.Failed)
+	}
+
+	gotShared, err := os.ReadFile(filepath.Join(dir, "shared-data.bin"))
+	if err != nil {
+		t.Fatalf("shared-data.bin 被误删（Moved 误配对，C1 复现）: %v", err)
+	}
+	if !bytes.Equal(gotShared, sharedData) {
+		t.Errorf("shared-data.bin 内容被意外改动: got %q want %q", gotShared, sharedData)
+	}
+
+	gotNewChamp, err := os.ReadFile(filepath.Join(dir, "new-champ.bin"))
+	if err != nil {
+		t.Fatalf("读取 new-champ.bin 失败: %v", err)
+	}
+	if !bytes.Equal(gotNewChamp, sharedData) {
+		t.Errorf("new-champ.bin 内容不匹配: got %q want %q", gotNewChamp, sharedData)
 	}
 }

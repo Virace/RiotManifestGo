@@ -69,11 +69,11 @@ type EventComplete struct {
 	TotalFiles  int
 	TotalChunks int
 	TotalBytes  int64
-	// FailedBundles 是关联到失败 BundleJob 的目标文件数（DownloadTasks 返回的
+	// FailedFiles 是关联到失败 BundleJob 的目标文件数（DownloadTasks 返回的
 	// failed 集合大小）：一个失败的 Job 可能覆盖多个文件，一个文件命中多个失败
 	// Job 时也只计一次，因此不等价于失败的 Job 个数。
-	FailedBundles int
-	Elapsed       time.Duration
+	FailedFiles int
+	Elapsed     time.Duration
 }
 
 // EventFileSkipped 在某个目标文件被判定为无需处理（内容与新清单一致，整文件跳过）时发出。

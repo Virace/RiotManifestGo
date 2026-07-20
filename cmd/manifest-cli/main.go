@@ -22,6 +22,7 @@ import (
 
 	"github.com/Virace/RiotManifestGo/pkg/core"
 	"github.com/Virace/RiotManifestGo/pkg/rman"
+	"github.com/Virace/RiotManifestGo/pkg/update"
 )
 
 const defaultCDNURL = "https://lol.dyn.riotcdn.net/channels/public/bundles"
@@ -44,6 +45,11 @@ func main() {
 	silent := flag.Bool("s", false, "静默模式，仅输出错误")
 	verbose := flag.Int("v", 0, "详细输出等级（0=默认进度条, 1=基础滚屏, 2=详细, 3=调试）")
 	showVersion := flag.Bool("version", false, "显示程序版本信息并退出")
+	updatePath := flag.String("update", "", "旧清单路径，用于增量更新比对（缺省时自动从本地存档发现）")
+	repair := flag.Bool("repair", false, "修复模式：逐文件重新校验并补齐本地缺失/损坏的内容，不做文件级跳过")
+	verifyOnly := flag.Bool("verify-only", false, "仅校验本地文件完整性，不下载、不写盘")
+	noVerify := flag.Bool("no-verify", false, "跳过校验，将全部匹配文件当作全新内容整体下载")
+	keepRemoved := flag.Bool("keep-removed", false, "保留旧清单中已不存在的文件，不清理磁盘（默认清理）")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "RiotManifestGo CLI (%s, commit %s) — Riot 游戏资源清单解析与下载\n\n", version, commit)
@@ -52,7 +58,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "示例:\n")
 		fmt.Fprintf(os.Stderr, "  manifest-cli game.manifest -list\n")
 		fmt.Fprintf(os.Stderr, "  manifest-cli https://...releases/XXX.manifest -list -p Aatrox -f ja_JP|ko_KR\n")
-		fmt.Fprintf(os.Stderr, "  manifest-cli game.manifest -p \"\\.dll\" -o ./output -log download.log\n\n")
+		fmt.Fprintf(os.Stderr, "  manifest-cli game.manifest -p \"\\.dll\" -o ./output -log download.log\n")
+		fmt.Fprintf(os.Stderr, "  manifest-cli new.manifest -o ./output                 # 增量更新（自动发现旧版本）\n")
+		fmt.Fprintf(os.Stderr, "  manifest-cli new.manifest -o ./output -update old.manifest\n")
+		fmt.Fprintf(os.Stderr, "  manifest-cli game.manifest -o ./output -verify-only    # 仅校验本地完整性\n")
+		fmt.Fprintf(os.Stderr, "  manifest-cli game.manifest -o ./output -repair         # 修复本地损坏内容\n\n")
 		fmt.Fprintf(os.Stderr, "参数:\n")
 		flag.PrintDefaults()
 	}
@@ -64,6 +74,12 @@ func main() {
 	if *showVersion {
 		fmt.Printf("RiotManifestGo version %s, commit %s\n", version, commit)
 		os.Exit(0)
+	}
+
+	updateMode, modeErr := resolveUpdateMode(*repair, *verifyOnly, *noVerify)
+	if modeErr != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", modeErr)
+		os.Exit(1)
 	}
 
 	if manifestSource == "" {
@@ -79,8 +95,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("❌ 解析失败: %v", err)
 	}
-	// manifest 原始字节供存档逻辑（update.Archive.Save）消费；CLI 尚未接入存档，显式丢弃。
-	_ = manifestRaw
 	printer.info("✅ ManifestID: %016X | 文件总数: %d\n\n", manifest.ManifestID, len(manifest.Files))
 
 	// 2. 过滤
@@ -104,26 +118,17 @@ func main() {
 		return
 	}
 
-	// 4. 下载模式
-	taskMap := core.Map(files)
-	var totalChunks int
-	var totalCompBytes int64
-	for _, tasks := range taskMap {
-		for _, task := range tasks {
-			totalChunks++
-			totalCompBytes += int64(task.CompressedSize)
-		}
+	// 4. 更新计划预览。具体待下载的 Chunk 集合由 Sync 按新旧清单差异动态决定
+	// （可能远小于 files 全集），因此这里不再预先计算 Map/Schedule——那只是
+	// Sync 内部下载执行阶段自己的事，重复算一遍并不会让预览更准确。
+	var totalDeclaredSize uint64
+	for _, f := range files {
+		totalDeclaredSize += f.FileSize
 	}
-	bundleJobs := core.Schedule(taskMap, core.ScheduleConfig{
-		MaxRangesPerReq: 30,
-		GapTolerance:    core.DefaultGapTolerance,
-	})
-
-	printer.info("📦 下载计划:\n")
+	printer.info("📦 更新计划:\n")
 	printer.info("   文件数: %d\n", len(files))
-	printer.info("   唯一 Chunk 数: %d\n", totalChunks)
-	printer.info("   Bundle Job 数: %d\n", len(bundleJobs))
-	printer.info("   待下载压缩数据: %s\n", humanSize(totalCompBytes))
+	printer.info("   声明总大小: %s\n", humanSize(int64(totalDeclaredSize)))
+	printer.info("   模式: %s\n", modeDescription(updateMode))
 	printer.info("   CDN: %s\n", *cdnURL)
 	printer.info("   Worker 数: %d\n\n", *workers)
 
@@ -151,40 +156,47 @@ func main() {
 	dlLog := &downloadLog{startTime: time.Now(), files: files}
 	go consumeEvents(dl.Events(), dlLog, printer)
 
-	printer.info("🚀 开始下载...\n")
+	if updateMode == update.ModeVerifyOnly {
+		printer.info("🔍 开始验证...\n")
+	} else {
+		printer.info("🚀 开始更新...\n")
+	}
 
-	// 心跳 ticker：每 2 秒刷新一次，即使没有新 Chunk 完成也显示 elapsed
+	// 心跳 ticker：每 2 秒刷新一次，即使没有新 Chunk 完成也显示 elapsed；
+	// ModeVerifyOnly 零下载、零写盘，进度以逐文件验证事件呈现，不需要心跳。
 	stopHeartbeat := make(chan struct{})
-	if !*silent && *verbose == 0 {
+	if !*silent && *verbose == 0 && updateMode != update.ModeVerifyOnly {
 		go heartbeat(dlLog, stopHeartbeat)
 	}
 
-	err = dl.Download(ctx, files)
+	opts := buildSyncOptions(updateMode, *updatePath, *keepRemoved)
+	stats, syncErr := update.Sync(ctx, manifest, manifestRaw, manifestSource, *outputDir, files, dl, opts)
 	close(stopHeartbeat)
 
 	printer.info("\n")
 
-	if err != nil {
+	elapsed := time.Since(dlLog.startTime)
+	if syncErr != nil {
 		if ctx.Err() != nil {
-			printer.info("⏹️  下载已取消\n")
+			printer.info("⏹️  更新已取消\n")
 		} else {
-			fmt.Fprintf(os.Stderr, "❌ 下载失败: %v\n", err)
+			fmt.Fprintf(os.Stderr, "❌ 更新失败: %v\n", syncErr)
 		}
 	} else {
-		printer.info("✅ 下载完成！耗时 %s\n", time.Since(dlLog.startTime).Round(time.Millisecond))
+		printSyncSummary(printer, updateMode, stats, elapsed)
 	}
 
 	// 保存日志
 	if *logFile != "" {
-		dlLog.elapsed = time.Since(dlLog.startTime)
-		if writeErr := saveLog(*logFile, dlLog, files, *verbose); writeErr != nil {
+		dlLog.elapsed = elapsed
+		if writeErr := saveLog(*logFile, dlLog, stats, updateMode, files, *verbose); writeErr != nil {
 			fmt.Fprintf(os.Stderr, "⚠️  保存日志失败: %v\n", writeErr)
 		} else {
 			printer.info("📝 日志已保存: %s\n", *logFile)
 		}
 	}
 
-	if err != nil {
+	if syncErr != nil || len(stats.Failed) > 0 {
 		os.Exit(1)
 	}
 }
@@ -217,6 +229,7 @@ type downloadLog struct {
 	files            []rman.FileEntry
 	chunksProcessed  int
 	bytesDownloaded  int64
+	bytesReused      int64
 	bundlesProcessed int
 	bundlesFailed    int
 	retries          int
@@ -286,18 +299,25 @@ func consumeEvents(events <-chan core.DownloadEvent, dl *downloadLog, printer *o
 			dl.mu.Unlock()
 			fmt.Fprintf(os.Stderr, "  ❌ %s\n", errMsg)
 
-		case core.EventComplete:
-			dl.mu.Lock()
-			speedStr := ""
-			if e.Elapsed.Seconds() > 0 {
-				avgSpeed := float64(dl.bytesDownloaded) / e.Elapsed.Seconds()
-				speedStr = fmt.Sprintf(" | 均速: %s/s", humanSize(int64(avgSpeed)))
+		case core.EventFileSkipped:
+			if printer.verbose >= 1 {
+				printer.info("  [SKIP] %s 内容未变，已跳过\n", e.Path)
 			}
+
+		case core.EventChunkReused:
+			dl.mu.Lock()
+			dl.bytesReused += e.Bytes
 			dl.mu.Unlock()
-			if printer.verbose == 0 && !printer.silent {
-				fmt.Printf("\r   📥 %s | Chunks: %d | Bundles: %d%s    ",
-					humanSize(dl.bytesDownloaded), dl.chunksProcessed, dl.bundlesProcessed, speedStr)
-				fmt.Println()
+			printer.detail("  [REUSE] %s 本地复用 %s\n", e.Path, humanSize(e.Bytes))
+
+		case core.EventFileRenamed:
+			if printer.verbose >= 1 {
+				printer.info("  [DONE] %s\n", filepath.Base(e.To))
+			}
+
+		case core.EventFileRemoved:
+			if printer.verbose >= 1 {
+				printer.info("  [REMOVE] %s\n", e.Path)
 			}
 		}
 	}
@@ -312,8 +332,8 @@ func printProgress(dl *downloadLog) {
 	if dl.currentSpeedBps > 0 {
 		speedStr = fmt.Sprintf(" | %s/s", humanSize(int64(dl.currentSpeedBps)))
 	}
-	fmt.Printf("\r   📥 %s | Chunks: %d | Bundles: %d%s | %s    ",
-		humanSize(dl.bytesDownloaded), dl.chunksProcessed, dl.bundlesProcessed,
+	fmt.Printf("\r   📥 下载 %s | 复用 %s | Chunks: %d | Bundles: %d%s | %s    ",
+		humanSize(dl.bytesDownloaded), humanSize(dl.bytesReused), dl.chunksProcessed, dl.bundlesProcessed,
 		speedStr, elapsed.Round(time.Second))
 }
 
@@ -388,9 +408,101 @@ func applyFilters(files []rman.FileEntry, pattern, flags string) ([]rman.FileEnt
 	return core.FilterWithError(files, opt)
 }
 
+// ---- 更新模式解析 ----
+
+// resolveUpdateMode 将 -repair/-verify-only/-no-verify 三个互斥 flag 映射为
+// update.Mode；三者两两互斥，同时指定多个视为用户输入错误。全部为 false 时
+// 退化为 update.ModeAuto（默认增量更新）。
+func resolveUpdateMode(repair, verifyOnly, noVerify bool) (update.Mode, error) {
+	count := 0
+	if repair {
+		count++
+	}
+	if verifyOnly {
+		count++
+	}
+	if noVerify {
+		count++
+	}
+	if count > 1 {
+		return update.ModeAuto, fmt.Errorf("-repair / -verify-only / -no-verify 互斥，只能指定一个")
+	}
+
+	switch {
+	case repair:
+		return update.ModeRepair, nil
+	case verifyOnly:
+		return update.ModeVerifyOnly, nil
+	case noVerify:
+		return update.ModeForceFull, nil
+	default:
+		return update.ModeAuto, nil
+	}
+}
+
+// buildSyncOptions 将 -update/-keep-removed 映射为 update.Options；keepRemoved
+// 语义上与 RemoveDeleted 相反（未指定 -keep-removed 时默认清理旧内容）。
+func buildSyncOptions(mode update.Mode, updatePath string, keepRemoved bool) update.Options {
+	return update.Options{
+		Mode:            mode,
+		OldManifestPath: updatePath,
+		RemoveDeleted:   !keepRemoved,
+	}
+}
+
+// modeDescription 返回 update.Mode 面向终端用户的中文描述。
+func modeDescription(mode update.Mode) string {
+	switch mode {
+	case update.ModeRepair:
+		return "修复（逐文件重新校验补洞）"
+	case update.ModeVerifyOnly:
+		return "仅验证（不下载不写盘）"
+	case update.ModeForceFull:
+		return "强制全量（跳过校验）"
+	default:
+		return "自动增量"
+	}
+}
+
+// printSyncSummary 输出一次 Sync 的汇总结果。ModeVerifyOnly 下 Stats.Failed
+// 表示"校验发现待修复"而非下载失败，因此单列逐文件校验结果、用不同措辞呈现；
+// 其余模式按跳过/修复/新建/移动/删除/失败分类汇总文件数与复用/下载字节数。
+func printSyncSummary(printer *outputPrinter, mode update.Mode, stats update.Stats, elapsed time.Duration) {
+	if mode == update.ModeVerifyOnly {
+		printer.info("🔍 验证结果:\n")
+		for _, p := range stats.Skipped {
+			printer.info("   ✅ %s\n", p)
+		}
+		for _, p := range stats.Failed {
+			printer.info("   ⚠️  待修复: %s\n", p)
+		}
+		printer.info("\n📊 验证完成，耗时 %s\n", elapsed.Round(time.Millisecond))
+		printer.info("   正常: %d | 待修复: %d\n", len(stats.Skipped), len(stats.Failed))
+		return
+	}
+
+	printer.info("✅ 更新完成！耗时 %s\n", elapsed.Round(time.Millisecond))
+	printer.info("📊 更新统计:\n")
+	printer.info("   跳过（内容未变）: %d\n", len(stats.Skipped))
+	printer.info("   修复/补丁: %d\n", len(stats.Patched))
+	printer.info("   新建: %d\n", len(stats.Created))
+	printer.info("   移动: %d\n", len(stats.Moved))
+	if len(stats.Removed) > 0 {
+		printer.info("   删除: %d\n", len(stats.Removed))
+	}
+	printer.info("   本地复用: %s\n", humanSize(stats.ReusedBytes))
+	printer.info("   网络下载: %s\n", humanSize(stats.DownloadedBytes))
+	if len(stats.Failed) > 0 {
+		printer.info("   失败: %d\n", len(stats.Failed))
+		for _, p := range stats.Failed {
+			printer.info("     ✗ %s\n", p)
+		}
+	}
+}
+
 // ---- 日志保存 ----
 
-func saveLog(path string, dl *downloadLog, files []rman.FileEntry, verboseLevel int) error {
+func saveLog(path string, dl *downloadLog, stats update.Stats, mode update.Mode, files []rman.FileEntry, verboseLevel int) error {
 	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
 		os.MkdirAll(dir, 0755)
@@ -399,8 +511,9 @@ func saveLog(path string, dl *downloadLog, files []rman.FileEntry, verboseLevel 
 	var sb strings.Builder
 
 	sb.WriteString("═══════════════════════════════════════\n")
-	sb.WriteString("  RiotManifestGo 下载日志\n")
+	sb.WriteString("  RiotManifestGo 更新日志\n")
 	sb.WriteString(fmt.Sprintf("  时间: %s\n", dl.startTime.Format("2006-01-02 15:04:05")))
+	sb.WriteString(fmt.Sprintf("  模式: %s\n", modeDescription(mode)))
 	sb.WriteString("═══════════════════════════════════════\n\n")
 
 	sb.WriteString(fmt.Sprintf("## 匹配文件列表 (%d 个)\n\n", len(files)))
@@ -413,15 +526,29 @@ func saveLog(path string, dl *downloadLog, files []rman.FileEntry, verboseLevel 
 			f.Path, humanSize(int64(f.FileSize)), len(f.Chunks), flagStr))
 	}
 
-	sb.WriteString("\n## 下载统计\n\n")
+	// ModeVerifyOnly 下 Stats.Failed 表示"校验发现待修复"而非下载失败，日志措辞
+	// 需要与 printSyncSummary 保持一致，避免误导为下载出错。
+	failedLabel := "失败"
+	if mode == update.ModeVerifyOnly {
+		failedLabel = "待修复"
+	}
+
+	sb.WriteString("\n## 更新统计\n\n")
 	sb.WriteString(fmt.Sprintf("  耗时: %s\n", dl.elapsed.Round(time.Millisecond)))
-	sb.WriteString(fmt.Sprintf("  已下载压缩数据: %s\n", humanSize(dl.bytesDownloaded)))
+	sb.WriteString(fmt.Sprintf("  本地复用: %s\n", humanSize(stats.ReusedBytes)))
+	sb.WriteString(fmt.Sprintf("  网络下载: %s\n", humanSize(stats.DownloadedBytes)))
+	sb.WriteString(fmt.Sprintf("  跳过: %d\n", len(stats.Skipped)))
+	sb.WriteString(fmt.Sprintf("  修复/补丁: %d\n", len(stats.Patched)))
+	sb.WriteString(fmt.Sprintf("  新建: %d\n", len(stats.Created)))
+	sb.WriteString(fmt.Sprintf("  移动: %d\n", len(stats.Moved)))
+	sb.WriteString(fmt.Sprintf("  删除: %d\n", len(stats.Removed)))
+	sb.WriteString(fmt.Sprintf("  %s: %d\n", failedLabel, len(stats.Failed)))
 	sb.WriteString(fmt.Sprintf("  Chunk 处理数: %d\n", dl.chunksProcessed))
 	sb.WriteString(fmt.Sprintf("  Bundle 完成数: %d\n", dl.bundlesProcessed))
 	sb.WriteString(fmt.Sprintf("  Bundle 失败数: %d\n", dl.bundlesFailed))
 	sb.WriteString(fmt.Sprintf("  重试次数: %d\n", dl.retries))
-	if dl.elapsed.Seconds() > 0 {
-		avgSpeed := float64(dl.bytesDownloaded) / dl.elapsed.Seconds()
+	if dl.elapsed.Seconds() > 0 && stats.DownloadedBytes > 0 {
+		avgSpeed := float64(stats.DownloadedBytes) / dl.elapsed.Seconds()
 		sb.WriteString(fmt.Sprintf("  平均下载速度: %s/s\n", humanSize(int64(avgSpeed))))
 	}
 
@@ -431,13 +558,20 @@ func saveLog(path string, dl *downloadLog, files []rman.FileEntry, verboseLevel 
 		sb.WriteString(fmt.Sprintf("  Gap Tolerance: %d KB\n", core.DefaultGapTolerance/1024))
 	}
 
+	if len(stats.Failed) > 0 {
+		sb.WriteString(fmt.Sprintf("\n## %s详情 (%d 个)\n\n", failedLabel, len(stats.Failed)))
+		for _, p := range stats.Failed {
+			sb.WriteString(fmt.Sprintf("  ✗ %s\n", p))
+		}
+	} else {
+		sb.WriteString(fmt.Sprintf("\n## %s详情\n\n  (无)\n", failedLabel))
+	}
+
 	if len(dl.errors) > 0 {
-		sb.WriteString(fmt.Sprintf("\n## 错误详情 (%d 个)\n\n", len(dl.errors)))
+		sb.WriteString(fmt.Sprintf("\n## Bundle 错误详情 (%d 个)\n\n", len(dl.errors)))
 		for _, e := range dl.errors {
 			sb.WriteString(fmt.Sprintf("  ✗ %s\n", e))
 		}
-	} else {
-		sb.WriteString("\n## 错误详情\n\n  (无错误)\n")
 	}
 
 	return os.WriteFile(path, []byte(sb.String()), 0644)
@@ -506,6 +640,7 @@ func extractManifestArg(args []string) (manifest string, remaining []string) {
 	flagsWithValue := map[string]bool{
 		"-o": true, "-u": true, "-p": true, "-f": true,
 		"-w": true, "-n": true, "-log": true, "-retry": true, "-v": true,
+		"-update": true,
 	}
 
 	remaining = make([]string, 0, len(args))

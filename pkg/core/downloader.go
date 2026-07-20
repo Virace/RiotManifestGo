@@ -161,11 +161,11 @@ func (d *Downloader) Download(ctx context.Context, files []rman.FileEntry) error
 
 	// 4. 完成事件
 	d.emit(EventComplete{
-		TotalFiles:    len(files),
-		TotalChunks:   totalChunks,
-		TotalBytes:    totalBytes,
-		FailedBundles: len(failed),
-		Elapsed:       time.Since(startTime),
+		TotalFiles:  len(files),
+		TotalChunks: totalChunks,
+		TotalBytes:  totalBytes,
+		FailedFiles: len(failed),
+		Elapsed:     time.Since(startTime),
 	})
 
 	return err

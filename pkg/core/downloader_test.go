@@ -491,8 +491,8 @@ func TestDownload_Events(t *testing.T) {
 			if complete.TotalChunks != 1 {
 				t.Errorf("EventComplete.TotalChunks = %d, 期望 1", complete.TotalChunks)
 			}
-			if complete.FailedBundles != 0 {
-				t.Errorf("EventComplete.FailedBundles = %d, 期望 0", complete.FailedBundles)
+			if complete.FailedFiles != 0 {
+				t.Errorf("EventComplete.FailedFiles = %d, 期望 0", complete.FailedFiles)
 			}
 		}
 	}

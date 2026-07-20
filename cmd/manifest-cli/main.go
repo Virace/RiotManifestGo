@@ -118,9 +118,8 @@ func main() {
 		return
 	}
 
-	// 4. 更新计划预览。具体待下载的 Chunk 集合由 Sync 按新旧清单差异动态决定
-	// （可能远小于 files 全集），因此这里不再预先计算 Map/Schedule——那只是
-	// Sync 内部下载执行阶段自己的事，重复算一遍并不会让预览更准确。
+	// 4. 更新计划预览。待下载的 Chunk 集合由 Sync 按新旧清单差异动态决定，可能
+	// 远小于 files 全集，因此预览只给出清单声明的总大小，不代表实际下载量。
 	var totalDeclaredSize uint64
 	for _, f := range files {
 		totalDeclaredSize += f.FileSize

@@ -103,8 +103,8 @@ func allMisses(entry rman.FileEntry) []ChunkRef {
 // 穷举猜测 HKDF → Blake3 → SHA256 → SHA512，任一算法命中即视为匹配，
 // 对齐 rman RChunk::hash_type 的猜测策略。
 //
-// 真实清单中无 params 条目的 Chunk 占比很高，其 ChunkID 仍是内容哈希；
-// 若一律判 miss 会导致本地完好数据被无谓地重新下载。
+// 无 params 条目的 Chunk 其 ChunkID 仍是内容哈希；若一律判 miss，本地完好
+// 数据会被无谓地重新下载。
 func matchChunk(data []byte, c rman.ChunkInfo) bool {
 	if c.HashType != rman.HashTypeNone {
 		return zstream.ComputeHash(data, c.HashType) == c.ChunkID

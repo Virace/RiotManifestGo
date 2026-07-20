@@ -929,8 +929,8 @@ func TestSync_Auto_PartialDownloadFailure_KeepsOldFileAndDoesNotAdvanceInstalled
 	}
 }
 
-// TestSync_Auto_SkipsCorruptedUnchanged_RepairFixes 验证 Spec §3 经验 1 的文档化
-// 权衡：ModeAuto 下与旧清单一致的（Unchanged）文件即使本地已损坏也不会被修复
+// TestSync_Auto_SkipsCorruptedUnchanged_RepairFixes 验证既定权衡：
+// ModeAuto 下与旧清单一致的（Unchanged）文件即使本地已损坏也不会被修复
 // （文件级跳过、不验证）；同一目录换 ModeRepair 重跑则能验证补洞、修复损坏。
 func TestSync_Auto_SkipsCorruptedUnchanged_RepairFixes(t *testing.T) {
 	mock := newMockFetcher()
@@ -1001,7 +1001,7 @@ func TestSync_Auto_SkipsCorruptedUnchanged_RepairFixes(t *testing.T) {
 // TestSync_Auto_Moved_SourceMissing_DiscardsStagingKeepsOthers 验证 Moved 在预分配
 // staging 之后、复制源内容之前就失败（旧路径已从磁盘消失）时：该文件计入
 // Stats.Failed 且新路径 staging 不残留、不生成最终文件；同批次里能正常提交的
-// Moved 文件不受影响，且 RemoveDeleted=true 时其旧路径按 Finding 2 的语义被删除；
+// Moved 文件不受影响，且 RemoveDeleted=true 时其旧路径被删除；
 // installed.json 不推进。
 func TestSync_Auto_Moved_SourceMissing_DiscardsStagingKeepsOthers(t *testing.T) {
 	mock := newMockFetcher()
@@ -1066,7 +1066,7 @@ func TestSync_Auto_Moved_SourceMissing_DiscardsStagingKeepsOthers(t *testing.T) 
 	}
 }
 
-// TestSync_Auto_Moved_RemoveDeletedTrue_DeletesSource 验证 Finding 2：RemoveDeleted=true
+// TestSync_Auto_Moved_RemoveDeletedTrue_DeletesSource 验证 RemoveDeleted=true
 // 时，成功提交的 Moved 配对的旧路径应被删除，新路径持有内容。
 func TestSync_Auto_Moved_RemoveDeletedTrue_DeletesSource(t *testing.T) {
 	mock := newMockFetcher()
@@ -1106,7 +1106,7 @@ func TestSync_Auto_Moved_RemoveDeletedTrue_DeletesSource(t *testing.T) {
 	}
 }
 
-// TestSync_Auto_Moved_RemoveDeletedFalse_KeepsSource 验证 Finding 2：RemoveDeleted=false
+// TestSync_Auto_Moved_RemoveDeletedFalse_KeepsSource 验证 RemoveDeleted=false
 // 时，成功提交的 Moved 配对的旧路径应原样保留。
 func TestSync_Auto_Moved_RemoveDeletedFalse_KeepsSource(t *testing.T) {
 	mock := newMockFetcher()
@@ -1141,7 +1141,7 @@ func TestSync_Auto_Moved_RemoveDeletedFalse_KeepsSource(t *testing.T) {
 }
 
 // TestSync_Auto_MissesAcrossTwoBundlesOneFails_WholeFileFailedStagingDiscarded 验证
-// Finding 3：单个文件的 Miss 分别落在两个不同 Bundle，其中一个 Bundle 下载失败、
+// 单个文件的 Miss 分别落在两个不同 Bundle，其中一个 Bundle 下载失败、
 // 另一个成功——DownloadTasks 按文件聚合失败（一个 Job 失败即整份文件不可信），
 // 因此整个文件都应计入 Stats.Failed，其 staging 已丢弃，旧内容保持不变。
 func TestSync_Auto_MissesAcrossTwoBundlesOneFails_WholeFileFailedStagingDiscarded(t *testing.T) {
@@ -1195,14 +1195,12 @@ func TestSync_Auto_MissesAcrossTwoBundlesOneFails_WholeFileFailedStagingDiscarde
 	}
 }
 
-// ---- C1 回归测试：过滤运行下必须按完整清单差分，不能用过滤子集当"新清单" ----
+// ---- 过滤运行：差分必须基于完整新旧清单，不能拿过滤子集当"新清单" ----
 //
-// 背景（终审 finding C1）：resolveDiff 曾经用 diff.Diff(oldManifest.Files, files)
-// 计算差分，其中 files 是 CLI -p/-f 过滤后的处理子集。旧清单里过滤范围外的路径
-// 在这份"新清单"里天然找不到匹配，会被 diff.Diff 判为 Removed（或被误配对成某个
-// 过滤内 Added 条目的 Moved 源），RemoveDeleted=true 时二者都会导致磁盘上仍被
-// 完整新清单声明的文件被误删。修复后 resolveDiff 改用完整的
-// diff.Diff(oldManifest.Files, newManifest.Files)，再按 files 收窄处理范围。
+// files 是 CLI -p/-f 过滤后的处理子集。若用它充当新清单一侧参与 diff，旧清单里
+// 过滤范围外的路径将天然找不到匹配，会被判为 Removed，或被误配对成某个过滤内
+// Added 条目的 Moved 源；RemoveDeleted=true 时二者都会删掉完整新清单仍然声明的
+// 文件。因此差分固定用完整新旧清单计算，再按 files 收窄处理范围。
 
 // TestSync_Auto_FilteredRun_RemovedFromCompleteDiff_KeepsOutOfFilterFiles 验证
 // Removed 判定必须来自完整新旧清单的 diff：过滤范围外但完整新清单仍然声明的
@@ -1257,7 +1255,7 @@ func TestSync_Auto_FilteredRun_RemovedFromCompleteDiff_KeepsOutOfFilterFiles(t *
 
 	gotAhri, err := os.ReadFile(filepath.Join(dir, "ahri.bin"))
 	if err != nil {
-		t.Fatalf("过滤外文件 ahri.bin 被误删（C1 复现）: %v", err)
+		t.Fatalf("过滤外但完整新清单仍声明的 ahri.bin 被误删: %v", err)
 	}
 	if !bytes.Equal(gotAhri, ahriData) {
 		t.Errorf("ahri.bin 内容被意外改动: got %q want %q", gotAhri, ahriData)
@@ -1323,7 +1321,7 @@ func TestSync_Auto_FilteredRun_MovedMispairingGuard_KeepsDeclaredOldPath(t *test
 
 	gotShared, err := os.ReadFile(filepath.Join(dir, "shared-data.bin"))
 	if err != nil {
-		t.Fatalf("shared-data.bin 被误删（Moved 误配对，C1 复现）: %v", err)
+		t.Fatalf("shared-data.bin 被误删（过滤外旧路径被误配对成 Moved 源）: %v", err)
 	}
 	if !bytes.Equal(gotShared, sharedData) {
 		t.Errorf("shared-data.bin 内容被意外改动: got %q want %q", gotShared, sharedData)

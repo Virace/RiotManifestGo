@@ -127,9 +127,8 @@ func (d *Downloader) Emit(event DownloadEvent) {
 
 // Download 执行完整的下载流程：预分配 staging → Mapper → DownloadTasks（自管 staging）。
 //
-// 对外签名与语义与重构前一致：接收完整文件列表，内部据此下载全部 Chunk 并在成功
-// 后覆盖 outputDir 下的最终文件。变化的只是写入方式——现在一律先落 staging 文件，
-// 全部作业成功后才原子替换旧文件，中途失败时旧文件保持完整。
+// 接收完整文件列表，内部据此下载全部 Chunk 并覆盖 outputDir 下的最终文件。写入
+// 一律先落 staging 文件，全部作业成功后才原子替换旧文件；中途失败时旧文件保持完整。
 func (d *Downloader) Download(ctx context.Context, files []rman.FileEntry) error {
 	defer close(d.events)
 	defer d.filePool.Close()
@@ -146,7 +145,7 @@ func (d *Downloader) Download(ctx context.Context, files []rman.FileEntry) error
 	taskMap := Map(files)
 
 	// 统计总量（供下方 EventComplete 使用；DownloadTasks 内部不感知“完整文件列表”
-	// 这一概念，因此总量统计留在 Download 这一层，与重构前保持一致的口径）
+	// 这一概念，因此总量统计留在 Download 这一层）
 	var totalChunks int
 	var totalBytes int64
 	for _, tasks := range taskMap {

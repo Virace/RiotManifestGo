@@ -52,8 +52,6 @@ func sameChunks(a, b []rman.ChunkInfo) bool {
 //
 // 指纹碰撞（不同序列得到相同指纹）是被允许的：分桶只是性能优化，
 // 是否真正配对始终由 sameChunks 精确核对决定，碰撞不影响正确性。
-// 采用 fnv32a 而非更大位宽的哈希，是刻意的取舍：对本工具面对的清单规模
-// （数千至数万文件）碰撞概率已足够低，同时便于用真实碰撞样例覆盖测试。
 func fingerprint(chunks []rman.ChunkInfo) uint32 {
 	h := fnv.New32a()
 	var buf [8]byte

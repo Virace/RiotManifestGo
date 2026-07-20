@@ -12,10 +12,8 @@ import (
 // empty path elements that could escape or alias the output root on different
 // platforms.
 //
-// Exported so pkg/update.Sync can resolve the same outputDir-relative target
-// paths as the downloader (staging/verify/moved/removed all need the exact
-// same path-safety rules); keeping one implementation avoids two independently
-// maintained copies of security-relevant path validation.
+// Shared by the downloader and pkg/update.Sync so that staging, verification,
+// moved and removed targets all resolve under identical path-safety rules.
 func OutputPath(outputDir, manifestPath string) (string, error) {
 	if manifestPath == "" {
 		return "", fmt.Errorf("manifest path is empty")

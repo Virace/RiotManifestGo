@@ -26,8 +26,8 @@ const (
 	// 处理（全量验证）。
 	ModeAuto Mode = iota
 	// ModeRepair 不做文件级跳过，逐文件按新清单重新验证补洞——用于修复被
-	// ModeAuto 跳过掩盖的本地损坏（Spec §3 经验 1：AUTO 跳过的 Unchanged 文件
-	// 从不验证，损坏无法自愈，必须有显式档位强制全量验证）。
+	// ModeAuto 跳过掩盖的本地损坏：AUTO 跳过的 Unchanged 文件从不验证，损坏
+	// 无法自愈，必须有显式档位强制全量验证。
 	ModeRepair
 	// ModeVerifyOnly 与 ModeRepair 一样逐文件验证，但零写盘、零下载、零存档，
 	// 仅用于诊断本地完整性（dry-run）。
@@ -117,7 +117,7 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 	downloadedByPath := make(map[string]int64)
 	failedSet := make(map[string]bool)
 
-	// 步骤 3：Moved —— 旧路径整文件流式复制到新路径 staging，替换统一在步骤 6 做。
+	// Moved 阶段：旧路径整文件流式复制到新路径 staging，替换统一在提交阶段做。
 	for _, pair := range diffResult.Moved {
 		if err := ctx.Err(); err != nil {
 			return Stats{}, err
@@ -138,7 +138,7 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 		pending = append(pending, pf)
 	}
 
-	// 步骤 4：Changed/Added（ModeRepair/ModeForceFull 下等价为全集）—— chunk 级
+	// 验证阶段：Changed/Added（ModeRepair/ModeForceFull 下等价为全集）—— chunk 级
 	// 验证补洞；ModeForceFull 跳过验证，全部视为 miss。
 	toVerify := make([]rman.FileEntry, 0, len(diffResult.Changed)+len(diffResult.Added))
 	toVerify = append(toVerify, diffResult.Changed...)
@@ -175,7 +175,7 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 	}
 
 	// Unchanged：只有 ModeAuto 找到旧清单时才可能非空，文件级快速跳过，不做任何验证
-	// （Spec §7 权衡：本地损坏的 Unchanged 文件在 AUTO 下不会被修复，需要 ModeRepair）。
+	// （本地损坏的 Unchanged 文件在 AUTO 下不会被修复，需要 ModeRepair）。
 	for _, entry := range diffResult.Unchanged {
 		fullPath, err := core.OutputPath(outputDir, entry.Path)
 		if err != nil {
@@ -185,16 +185,16 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 		d.Emit(core.EventFileSkipped{Path: fullPath})
 	}
 
-	// 步骤 5：Misses → taskMap → DownloadTasks(ManageStaging: false)，写入落 staging
+	// 下载阶段：Misses → taskMap → DownloadTasks(ManageStaging: false)，写入落 staging
 	// 由 Downloader 保证；ManageStaging=false 下 DownloadTasks 返回前会释放它自己
-	// 打开的 staging 句柄，本函数随后仍需对自己（Sync 侧 FilePool）持有的句柄
-	// 单独 ClosePath（步骤 6）。
+	// 打开的 staging 句柄，本函数随后仍需在提交阶段对自己（Sync 侧 FilePool）持有
+	// 的句柄单独 ClosePath。
 	if len(missesByPath) > 0 {
 		taskMap := buildMissTaskMap(missesByPath)
 		downloadFailed, dlErr := d.DownloadTasks(ctx, taskMap, core.TaskOptions{ManageStaging: false})
 		if dlErr != nil && ctx.Err() != nil {
 			// Context 取消：无法确认哪些 staging 已经完整，本函数尚未提交任何文件
-			// （提交统一在步骤 6），直接返回，留待调用方决定是否重试整个 Sync。
+			// （提交统一在提交阶段），直接返回，留待调用方决定是否重试整个 Sync。
 			return Stats{}, ctx.Err()
 		}
 		for path := range downloadFailed {
@@ -202,9 +202,9 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 		}
 	}
 
-	// 步骤 6：提交/丢弃。非 failed 文件 ClosePath+CommitStaging（含 Moved，发
+	// 提交阶段：非 failed 文件 ClosePath+CommitStaging（含 Moved，发
 	// EventFileRenamed）；failed 文件 ClosePath+DiscardStaging。Moved 成功提交后
-	// 额外记下其旧路径，供本步骤末尾按 RemoveDeleted 决定是否清理源文件——旧路径
+	// 额外记下其旧路径，供本阶段末尾按 RemoveDeleted 决定是否清理源文件——旧路径
 	// 此时只是重命名前的内容重复副本，不应该跟随提交结果永久留在磁盘上。
 	var movedSources []string
 	for _, pf := range pending {
@@ -235,7 +235,7 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 		}
 	}
 
-	// 步骤 7：RemoveDeleted → 删除 diff.Result.Removed 路径（发 EventFileRemoved）
+	// 清理阶段：RemoveDeleted → 删除 diff.Result.Removed 路径（发 EventFileRemoved）
 	// 与成功提交的 Moved 旧路径（不计入 Stats.Removed、不发额外事件——
 	// EventFileRenamed 已经表达了 From→To 的迁移语义，见 removeMovedSources 注释）。
 	if opts.RemoveDeleted {
@@ -245,7 +245,7 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 		}
 	}
 
-	// 步骤 8：failed 为空 → Archive.Save(新清单)；否则不推进 installed.json。
+	// 存档阶段：failed 为空 → Archive.Save(新清单)；否则不推进 installed.json。
 	if len(stats.Failed) == 0 {
 		archive := NewArchive(outputDir)
 		if err := archive.Save(newManifest.ManifestID, rawManifest, source); err != nil {
@@ -267,10 +267,10 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 //     指定的路径解析失败视为硬错误（用户明确要求了某个旧清单，不能默默忽略）；
 //     自动发现的路径解析失败退化为"无旧清单"（那只是内部存档缓存，不应让它的
 //     损坏拖垮整次 Sync）。完全没有旧清单时，把 files 全部视为 Changed
-//     （Spec §7："Unchanged 默认不验证——不带旧清单跑一次即得全量验证"），
+//     （Unchanged 默认不验证，因此不带旧清单跑一次即等价于全量验证），
 //     Unchanged/Added/Moved/Removed 均为空。
 //   - ModeRepair/ModeVerifyOnly：不解析旧清单、不做 diff，files 全部视为 Changed
-//     （Spec §3 经验 1：不做文件级跳过）。
+//     （不做文件级跳过）。
 //   - ModeForceFull：不解析旧清单，files 全部视为 Added（对应"跳过验证、整体重下"）。
 func resolveDiff(outputDir string, newManifest *rman.Manifest, files []rman.FileEntry, opts Options) (diff.Result, error) {
 	switch opts.Mode {
@@ -377,7 +377,7 @@ func verifyOnlySync(ctx context.Context, entries []rman.FileEntry, outputDir str
 }
 
 // discardPreallocatedStaging 尽力清理一个已经 PreallocateFile 成功、但调用方在
-// 提交流程（步骤 6）之前就失败退出的 staging：先 ClosePath 释放 FilePool 持有的
+// 提交阶段之前就失败退出的 staging：先 ClosePath 释放 FilePool 持有的
 // 句柄（Windows 下句柄未释放会导致后续删除失败），再删除 staging 文件本身。这两
 // 步失败都不覆盖调用方已经拿到的真实错误，属于尽力而为的收尾。
 func discardPreallocatedStaging(pool *fswriter.FilePool, fullPath, stagingPath string) {
@@ -391,7 +391,7 @@ func discardPreallocatedStaging(pool *fswriter.FilePool, fullPath, stagingPath s
 //
 // 预分配 staging 之后的任何错误退出（源文件打开/读取失败、写入 staging 失败）都
 // 会先清理已经创建的 staging，不依赖调用方后续统一收尾——这类错误发生在文件进入
-// 步骤 6 的提交/丢弃流程之前，不清理就会残留半成品 staging。
+// 提交阶段之前，不清理就会残留半成品 staging。
 func processMoved(path, fullPath, srcPath string, fileSize uint64, pool *fswriter.FilePool, d *core.Downloader) (pendingFile, error) {
 	stagingPath := fswriter.StagingPath(fullPath)
 	if err := pool.PreallocateFile(stagingPath, int64(fileSize)); err != nil {
@@ -480,7 +480,7 @@ func processPatchEntry(path, fullPath string, entry rman.FileEntry, pool *fswrit
 	}
 
 	// 以下 Hits 复制阶段的任何错误都会先清理刚预分配的 staging：这批错误发生在
-	// 文件进入步骤 6 的提交/丢弃流程之前，不清理就会残留半成品 staging。
+	// 文件进入提交阶段之前，不清理就会残留半成品 staging。
 	var reused int64
 	if result.Exists && len(result.Hits) > 0 {
 		old, err := os.Open(fullPath)
@@ -578,7 +578,7 @@ func removeDeleted(outputDir string, removed []string, d *core.Downloader, stats
 }
 
 // removeMovedSources 删除成功提交的 Moved 配对的旧路径（sources 为磁盘绝对路径，
-// 只包含步骤 6 里已经 CommitStaging 成功的配对——失败的配对从未被加入这份列表，
+// 只包含提交阶段已经 CommitStaging 成功的配对——失败的配对从未被加入这份列表，
 // 天然满足"目标提交失败时不动源文件"的约束）。只删除常规文件，路径已不存在或
 // 不是常规文件（如目录、符号链接）时跳过，不视为错误；单个文件的删除失败是
 // 尽力而为，不阻塞其余路径，与 removeDeleted 的语义一致。这里不写 Stats.Removed、

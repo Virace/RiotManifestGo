@@ -1,7 +1,9 @@
 package main
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Virace/RiotManifestGo/pkg/rman"
 	"github.com/Virace/RiotManifestGo/pkg/update"
@@ -146,5 +148,138 @@ func TestExtractManifestArgTreatsRepairVerifyOnlyNoVerifyAsBoolFlags(t *testing.
 	want := []string{"-repair", "-verify-only", "-no-verify", "-keep-removed"}
 	if len(remaining) != len(want) {
 		t.Fatalf("remaining = %v, want %v", remaining, want)
+	}
+}
+
+// ---- manifestInfoLines：启动横幅元信息 ----
+
+// infoTestManifest 构造横幅测试用清单：2 文件共 3 个唯一 Chunk（其中 0xB1 被
+// 两个文件共享，验证压缩总量按唯一 ChunkID 去重）、2 个 Bundle、1 条参数。
+func infoTestManifest() *rman.Manifest {
+	shared := rman.ChunkInfo{ChunkID: 0xB1, BundleID: 0x2, CompressedSize: 300, HashType: rman.HashTypeHKDF}
+	return &rman.Manifest{
+		ManifestID:   0x1122334455667788,
+		MajorVersion: 2,
+		MinorVersion: 1,
+		Flags:        []string{"en_US", "zh_CN"},
+		Params: []rman.Params{
+			{HashType: rman.HashTypeHKDF, MinChunkSize: 4096, MaxChunkSize: 16384, MaxUncompressed: 16384},
+		},
+		Files: []rman.FileEntry{
+			{Path: "a.wad", FileSize: 1000, Chunks: []rman.ChunkInfo{
+				{ChunkID: 0xA1, BundleID: 0x1, CompressedSize: 100, HashType: rman.HashTypeHKDF},
+				shared,
+			}},
+			{Path: "b.wad", FileSize: 2000, Chunks: []rman.ChunkInfo{
+				shared,
+				{ChunkID: 0xC1, BundleID: 0x2, CompressedSize: 200, HashType: rman.HashTypeHKDF},
+			}},
+		},
+	}
+}
+
+func linesContain(lines []string, sub string) bool {
+	for _, l := range lines {
+		if strings.Contains(l, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestManifestInfoLinesShowsManifestFacts(t *testing.T) {
+	lines := manifestInfoLines(infoTestManifest(), manifestSourceMeta{size: 12345})
+
+	for _, want := range []string{
+		"ManifestID: 1122334455667788",
+		"RMAN v2.1",
+		"文件: 2",
+		"Chunk: 3",   // 唯一 ChunkID 去重后 3 个
+		"Bundle: 2",  // 0x1 与 0x2
+		"600 B",      // 压缩总量 100+300+200，共享 Chunk 只计一次
+		"哈希算法: HKDF",
+		"4.0 KB ~ 16.0 KB",
+		"en_US, zh_CN（共 2 个）",
+	} {
+		if !linesContain(lines, want) {
+			t.Errorf("横幅缺少 %q，实际输出:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestManifestInfoLinesMarksURLTimeAsGuessed(t *testing.T) {
+	meta := manifestSourceMeta{
+		size:    100,
+		modTime: time.Date(2023, 8, 3, 8, 38, 0, 0, time.UTC),
+		fromURL: true,
+	}
+	lines := manifestInfoLines(infoTestManifest(), meta)
+
+	if !linesContain(lines, "推测") {
+		t.Errorf("URL 来源的清单时间必须标注推测，实际输出:\n%s", strings.Join(lines, "\n"))
+	}
+	if !linesContain(lines, "Last-Modified") {
+		t.Errorf("URL 来源的清单时间应说明来自 Last-Modified 响应头，实际输出:\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+func TestManifestInfoLinesMarksLocalMtimeAsGuessed(t *testing.T) {
+	meta := manifestSourceMeta{
+		size:    100,
+		modTime: time.Date(2026, 7, 18, 21, 0, 0, 0, time.Local),
+	}
+	lines := manifestInfoLines(infoTestManifest(), meta)
+
+	if !linesContain(lines, "推测") {
+		t.Errorf("本地文件时间必须标注推测，实际输出:\n%s", strings.Join(lines, "\n"))
+	}
+	if !linesContain(lines, "本地文件修改时间") {
+		t.Errorf("本地来源应说明时间取自文件系统 mtime，实际输出:\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+func TestManifestInfoLinesUnknownTime(t *testing.T) {
+	lines := manifestInfoLines(infoTestManifest(), manifestSourceMeta{size: 100})
+	if !linesContain(lines, "清单时间: 未知") {
+		t.Errorf("时间缺失时应显示未知，实际输出:\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+func TestManifestInfoLinesNotesFilesWithoutDeclaredHash(t *testing.T) {
+	m := infoTestManifest()
+	m.Files = append(m.Files, rman.FileEntry{Path: "c.wad", FileSize: 10, Chunks: []rman.ChunkInfo{
+		{ChunkID: 0xD1, BundleID: 0x3, CompressedSize: 10, HashType: rman.HashTypeNone},
+	}})
+	lines := manifestInfoLines(m, manifestSourceMeta{size: 100})
+
+	if !linesContain(lines, "1 个文件的 Chunk 哈希算法未声明") {
+		t.Errorf("存在 HashTypeNone 文件时应输出提示，实际输出:\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+func TestManifestInfoLinesNoParamsTable(t *testing.T) {
+	m := infoTestManifest()
+	m.Params = nil
+	lines := manifestInfoLines(m, manifestSourceMeta{size: 100})
+
+	if !linesContain(lines, "哈希算法: 未声明") {
+		t.Errorf("无 Parameters 表时应显示未声明，实际输出:\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+// ---- humanCount ----
+
+func TestHumanCount(t *testing.T) {
+	cases := map[int]string{
+		0:       "0",
+		999:     "999",
+		1000:    "1,000",
+		787480:  "787,480",
+		1000000: "1,000,000",
+	}
+	for n, want := range cases {
+		if got := humanCount(n); got != want {
+			t.Errorf("humanCount(%d) = %q, want %q", n, got, want)
+		}
 	}
 }

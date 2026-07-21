@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -91,11 +92,14 @@ func main() {
 
 	// 1. 解析 Manifest
 	printer.info("📄 解析 manifest: %s\n", manifestSource)
-	manifest, manifestRaw, err := loadManifest(manifestSource)
+	manifest, manifestRaw, srcMeta, err := loadManifest(manifestSource)
 	if err != nil {
 		log.Fatalf("❌ 解析失败: %v", err)
 	}
-	printer.info("✅ ManifestID: %016X | 文件总数: %d\n\n", manifest.ManifestID, len(manifest.Files))
+	for _, line := range manifestInfoLines(manifest, srcMeta) {
+		printer.info("%s\n", line)
+	}
+	printer.info("\n")
 
 	// 2. 过滤
 	files := manifest.Files
@@ -352,51 +356,150 @@ func heartbeat(dl *downloadLog, stop <-chan struct{}) {
 
 // ---- 远程 Manifest 获取 ----
 
-// loadManifest 解析 manifest，同时返回其原始字节，供调用方在需要时存档
-// （写入 update.Archive）。
-func loadManifest(source string) (*rman.Manifest, []byte, error) {
+// manifestSourceMeta 记录清单来源的旁路信息（大小与时间），供启动横幅展示。
+// RMAN 格式本身不含任何时间字段，modTime 只能取自来源侧旁证：URL 下载读 CDN
+// 的 Last-Modified 响应头，本地文件读文件系统 mtime（通常是下载到本地的时刻）。
+// 两者都是推测值，展示时必须标注来源，不能当作清单官方字段。
+type manifestSourceMeta struct {
+	size    int64
+	modTime time.Time // 零值表示未知
+	fromURL bool
+}
+
+// loadManifest 解析 manifest，同时返回其原始字节（供调用方在需要时存档，
+// 写入 update.Archive）与来源旁路信息。
+func loadManifest(source string) (*rman.Manifest, []byte, manifestSourceMeta, error) {
 	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
 		return loadManifestFromURL(source)
 	}
 	return loadManifestFromFile(source)
 }
 
-func loadManifestFromFile(path string) (*rman.Manifest, []byte, error) {
+func loadManifestFromFile(path string) (*rman.Manifest, []byte, manifestSourceMeta, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("读取 manifest 文件失败: %w", err)
+		return nil, nil, manifestSourceMeta{}, fmt.Errorf("读取 manifest 文件失败: %w", err)
+	}
+	meta := manifestSourceMeta{size: int64(len(data))}
+	if fi, statErr := os.Stat(path); statErr == nil {
+		meta.modTime = fi.ModTime()
 	}
 	manifest, err := rman.Parse(bytes.NewReader(data))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, meta, err
 	}
-	return manifest, data, nil
+	return manifest, data, meta, nil
 }
 
-func loadManifestFromURL(url string) (*rman.Manifest, []byte, error) {
+func loadManifestFromURL(url string) (*rman.Manifest, []byte, manifestSourceMeta, error) {
 	client := &http.Client{
 		Timeout: 60 * time.Second,
 	}
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil, nil, fmt.Errorf("下载 manifest 失败: %w", err)
+		return nil, nil, manifestSourceMeta{}, fmt.Errorf("下载 manifest 失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("下载 manifest 失败: HTTP %d", resp.StatusCode)
+		return nil, nil, manifestSourceMeta{}, fmt.Errorf("下载 manifest 失败: HTTP %d", resp.StatusCode)
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, fmt.Errorf("读取 manifest 数据失败: %w", err)
+		return nil, nil, manifestSourceMeta{}, fmt.Errorf("读取 manifest 数据失败: %w", err)
+	}
+
+	meta := manifestSourceMeta{size: int64(len(data)), fromURL: true}
+	if lm := resp.Header.Get("Last-Modified"); lm != "" {
+		if t, parseErr := http.ParseTime(lm); parseErr == nil {
+			meta.modTime = t
+		}
 	}
 
 	manifest, err := rman.Parse(bytes.NewReader(data))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, meta, err
 	}
-	return manifest, data, nil
+	return manifest, data, meta, nil
+}
+
+// manifestInfoLines 生成启动横幅的清单元信息行。除"清单时间"外的所有信息都
+// 直接来自清单本身或其原始字节；时间是推测值，行内附带来源说明，避免被当作
+// RMAN 官方字段误读。
+func manifestInfoLines(m *rman.Manifest, meta manifestSourceMeta) []string {
+	// 全清单聚合：唯一 Chunk/Bundle 计数、声明内容总量、压缩总量。
+	// 同一 Chunk 可被多个文件引用，压缩总量按唯一 ChunkID 去重统计。
+	uniqueChunks := make(map[uint64]uint32)
+	uniqueBundles := make(map[uint64]struct{})
+	var contentSize uint64
+	filesNoHash := 0
+	for i := range m.Files {
+		f := &m.Files[i]
+		contentSize += f.FileSize
+		if len(f.Chunks) > 0 && f.Chunks[0].HashType == rman.HashTypeNone {
+			filesNoHash++
+		}
+		for _, c := range f.Chunks {
+			uniqueChunks[c.ChunkID] = c.CompressedSize
+			uniqueBundles[c.BundleID] = struct{}{}
+		}
+	}
+	var compressedSize uint64
+	for _, size := range uniqueChunks {
+		compressedSize += uint64(size)
+	}
+
+	lines := []string{fmt.Sprintf("✅ ManifestID: %016X | RMAN v%d.%d | 文件: %s",
+		m.ManifestID, m.MajorVersion, m.MinorVersion, humanCount(len(m.Files)))}
+
+	avgChunk := "-"
+	if len(uniqueChunks) > 0 {
+		avgChunk = humanSize(int64(compressedSize / uint64(len(uniqueChunks))))
+	}
+	lines = append(lines, fmt.Sprintf("   内容大小: %s | 压缩大小: %s | Chunk: %s | Bundle: %s | 平均 Chunk: %s",
+		humanSize(int64(contentSize)), humanSize(int64(compressedSize)),
+		humanCount(len(uniqueChunks)), humanCount(len(uniqueBundles)), avgChunk))
+
+	if len(m.Params) == 0 {
+		lines = append(lines, "   哈希算法: 未声明（清单无 Parameters 表，校验时按穷举推断）")
+	} else {
+		for i, p := range m.Params {
+			prefix := "   "
+			if len(m.Params) > 1 {
+				prefix = fmt.Sprintf("   参数[%d] ", i)
+			}
+			lines = append(lines, fmt.Sprintf("%s哈希算法: %s | 分块范围: %s ~ %s | 单块最大原始: %s",
+				prefix, p.HashType,
+				humanSize(int64(p.MinChunkSize)), humanSize(int64(p.MaxChunkSize)),
+				humanSize(int64(p.MaxUncompressed))))
+		}
+		if filesNoHash > 0 {
+			lines = append(lines, fmt.Sprintf(
+				"   注: %d 个文件的 Chunk 哈希算法未声明（param_index 未命中有效条目，校验时按穷举推断）",
+				filesNoHash))
+		}
+	}
+
+	if len(m.Flags) > 0 {
+		lines = append(lines, fmt.Sprintf("   标记: %s（共 %d 个）",
+			strings.Join(m.Flags, ", "), len(m.Flags)))
+	}
+
+	timeLine := "   清单大小: " + humanSize(meta.size)
+	switch {
+	case meta.modTime.IsZero():
+		timeLine += " | 清单时间: 未知（RMAN 格式无时间字段）"
+	case meta.fromURL:
+		timeLine += fmt.Sprintf(" | 清单时间: %s（推测：来自 CDN Last-Modified 响应头，RMAN 格式无时间字段）",
+			meta.modTime.Local().Format("2006-01-02 15:04:05 -0700"))
+	default:
+		timeLine += fmt.Sprintf(" | 清单时间: %s（推测：本地文件修改时间，通常为下载时刻，RMAN 格式无时间字段）",
+			meta.modTime.Local().Format("2006-01-02 15:04:05 -0700"))
+	}
+	lines = append(lines, timeLine)
+
+	return lines
 }
 
 func applyFilters(files []rman.FileEntry, pattern, flags string) ([]rman.FileEntry, error) {
@@ -621,6 +724,26 @@ func printFileList(files []rman.FileEntry, limit int) {
 }
 
 // ---- 工具函数 ----
+
+// humanCount 返回带千位分隔符的十进制计数（如 787480 -> "787,480"）。
+func humanCount(n int) string {
+	s := strconv.Itoa(n)
+	if n < 0 || len(s) <= 3 {
+		return s
+	}
+	var sb strings.Builder
+	pre := len(s) % 3
+	if pre > 0 {
+		sb.WriteString(s[:pre])
+	}
+	for i := pre; i < len(s); i += 3 {
+		if sb.Len() > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(s[i : i+3])
+	}
+	return sb.String()
+}
 
 func humanSize(b int64) string {
 	const unit = 1024

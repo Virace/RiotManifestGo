@@ -75,6 +75,15 @@ type FileEntry struct {
 type Manifest struct {
 	// ManifestID 来自文件头第 16-24 字节
 	ManifestID uint64
+	// MajorVersion/MinorVersion 是文件头声明的 RMAN 格式版本（如 2.0、2.1）
+	MajorVersion uint8
+	MinorVersion uint8
+	// Flags 是清单声明的全部标记名（语言/区域/平台等），按 flag_id 升序。
+	// FileEntry.Flags 取值于此集合，可作为按 Flag 过滤时的候选值列表。
+	Flags []string
+	// Params 是清单 Parameters 表的全部条目（Chunk 哈希算法与分块参数），
+	// FileEntry 通过 param_index 引用其中一条。
+	Params []Params
 	// Files 该 Manifest 包含的所有游戏文件列表
 	Files []FileEntry
 }
@@ -92,8 +101,10 @@ type Header struct {
 // rmanMagic RMAN 文件的魔数（ASCII "RMAN"）
 var rmanMagic = [4]byte{'R', 'M', 'A', 'N'}
 
-// parameters 是 FlatBuffers Body 中 Parameters 对象的内部表示。
-type parameters struct {
+// Params 是 FlatBuffers Body 中 Parameters 表的一个条目，描述一组文件共用的
+// Chunk 哈希算法与分块尺寸参数。FileEntry 的 param_index 越界（未指向有效条目）
+// 时，该文件的 Chunk 哈希算法按 HashTypeNone 处理（见 parseFileEntries）。
+type Params struct {
 	HashType        HashType
 	MinChunkSize    uint32
 	MaxChunkSize    uint32

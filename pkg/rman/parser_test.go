@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // ---- 辅助函数 ----
@@ -312,7 +314,7 @@ func TestParseBodyMalformedFlatBuffersReturnsError(t *testing.T) {
 		}
 	}()
 
-	if _, err := parseBody(body); err == nil {
+	if _, _, _, err := parseBody(body); err == nil {
 		t.Fatal("parseBody should reject malformed FlatBuffers body")
 	}
 }
@@ -480,4 +482,275 @@ func buildFBBodyUsingRawBytes() []byte {
 	patch32(rootOffPlaceholder, uint32(rootTablePos))
 
 	return buf
+}
+
+// buildFBBodyWithMetadata 构造一个带清单级元信息的 FlatBuffers body，
+// 用于验证 Languages/Parameters 提取与 param_index 哈希类型关联：
+//
+//   - 1 个 Bundle（ID=0x1234），含 2 个 Chunk（0xAAAA/100B、0xBBBB/150B）
+//   - 2 个 Language：flag_id=1 "en_US"、flag_id=2 "zh_CN"
+//   - 1 个 Parameters 条目：HashType=HKDF, min=4096, max=16384, maxUncomp=16384
+//   - 1 个 FileEntry："root.wad"，500B，language_mask=0b10（zh_CN），
+//     chunk_ids=[0xAAAA,0xBBBB]，param_index=0
+func buildFBBodyWithMetadata() []byte {
+	buf := make([]byte, 0, 1024)
+
+	wr8 := func(v uint8) int {
+		pos := len(buf)
+		buf = append(buf, v)
+		return pos
+	}
+	wr16 := func(v uint16) int {
+		pos := len(buf)
+		buf = append(buf, byte(v), byte(v>>8))
+		return pos
+	}
+	wr32 := func(v uint32) int {
+		pos := len(buf)
+		buf = append(buf, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+		return pos
+	}
+	wr64 := func(v uint64) int {
+		pos := len(buf)
+		buf = append(buf, byte(v), byte(v>>8), byte(v>>16), byte(v>>24),
+			byte(v>>32), byte(v>>40), byte(v>>48), byte(v>>56))
+		return pos
+	}
+	patch32 := func(pos int, v uint32) {
+		buf[pos] = byte(v)
+		buf[pos+1] = byte(v >> 8)
+		buf[pos+2] = byte(v >> 16)
+		buf[pos+3] = byte(v >> 24)
+	}
+	// FlatBuffers 字符串：[u32 长度][UTF-8 字节][NUL]，返回绝对位置
+	writeString := func(s string) int {
+		pos := wr32(uint32(len(s)))
+		buf = append(buf, s...)
+		buf = append(buf, 0)
+		return pos
+	}
+	// Table 型 vector：[u32 count][referenceOffset...]，元素指向已写入的子 Table
+	writeTableVector := func(tablePositions []int) int {
+		pos := wr32(uint32(len(tablePositions)))
+		for _, tp := range tablePositions {
+			slot := wr32(0)
+			patch32(slot, uint32(int32(tp)-int32(slot)))
+		}
+		return pos
+	}
+
+	rootOffPlaceholder := wr32(0)
+
+	// ── Chunk Table（同 buildFBBodyUsingRawBytes 的布局）──
+	buildChunk := func(chunkID uint64, compSize, uncompSize uint32) int {
+		vtablePos := len(buf)
+		wr16(10) // vtable_len
+		wr16(24) // obj_size
+		wr16(8)  // field0 chunk_id
+		wr16(16) // field1 compressed_size
+		wr16(20) // field2 uncompressed_size
+		tablePos := len(buf)
+		soffsetPos := wr32(0)
+		patch32(soffsetPos, uint32(int32(tablePos)-int32(vtablePos)))
+		wr32(0) // padding
+		wr64(chunkID)
+		wr32(compSize)
+		wr32(uncompSize)
+		return tablePos
+	}
+	c0 := buildChunk(0xAAAA, 100, 200)
+	c1 := buildChunk(0xBBBB, 150, 300)
+	chunkVecPos := writeTableVector([]int{c0, c1})
+
+	// ── Bundle Table：field0=bundle_id, field1=chunks(vector) ──
+	bundleVtablePos := len(buf)
+	wr16(8)  // vtable_len
+	wr16(20) // obj_size
+	wr16(8)  // field0 bundle_id
+	wr16(16) // field1 chunks
+	bundleTablePos := len(buf)
+	bSoffset := wr32(0)
+	patch32(bSoffset, uint32(int32(bundleTablePos)-int32(bundleVtablePos)))
+	wr32(0) // padding
+	wr64(0x1234)
+	chunkRefPos := wr32(0)
+	patch32(chunkRefPos, uint32(int32(chunkVecPos)-int32(chunkRefPos)))
+	bundleVecPos := writeTableVector([]int{bundleTablePos})
+
+	// ── Language Table：field0=flag_id(uint8), field1=name(string) ──
+	buildLanguage := func(flagID uint8, name string) int {
+		strPos := writeString(name)
+		vtablePos := len(buf)
+		wr16(8)  // vtable_len
+		wr16(12) // obj_size
+		wr16(4)  // field0 flag_id
+		wr16(8)  // field1 name
+		tablePos := len(buf)
+		soffsetPos := wr32(0)
+		patch32(soffsetPos, uint32(int32(tablePos)-int32(vtablePos)))
+		wr8(flagID)
+		wr8(0) // padding ×3，对齐 name ref 到 tableStart+8
+		wr8(0)
+		wr8(0)
+		nameRefPos := wr32(0)
+		patch32(nameRefPos, uint32(int32(strPos)-int32(nameRefPos)))
+		return tablePos
+	}
+	lang0 := buildLanguage(1, "en_US")
+	lang1 := buildLanguage(2, "zh_CN")
+	langVecPos := writeTableVector([]int{lang0, lang1})
+
+	// ── Parameters Table：field1=hash_type(uint8), field2=min, field3=max,
+	// field4=max_uncompressed（field0 未使用）──
+	paramVtablePos := len(buf)
+	wr16(14) // vtable_len = 4 + 5*2
+	wr16(20) // obj_size
+	wr16(0)  // field0（未使用）
+	wr16(4)  // field1 hash_type
+	wr16(8)  // field2 min_chunk_size
+	wr16(12) // field3 max_chunk_size
+	wr16(16) // field4 max_uncompressed
+	paramTablePos := len(buf)
+	pSoffset := wr32(0)
+	patch32(pSoffset, uint32(int32(paramTablePos)-int32(paramVtablePos)))
+	wr8(uint8(HashTypeHKDF))
+	wr8(0) // padding ×3
+	wr8(0)
+	wr8(0)
+	wr32(4096)  // min_chunk_size
+	wr32(16384) // max_chunk_size
+	wr32(16384) // max_uncompressed
+	paramVecPos := writeTableVector([]int{paramTablePos})
+
+	// ── FileEntry Table：field2=file_size, field3=name, field4=language_mask,
+	// field7=chunk_ids(vector), field11=param_index ──
+	fileNamePos := writeString("root.wad")
+	chunkIDsVecPos := len(buf)
+	wr32(2) // count
+	wr64(0xAAAA)
+	wr64(0xBBBB)
+
+	fileVtablePos := len(buf)
+	wr16(28) // vtable_len = 4 + 12*2（field0..field11）
+	wr16(32) // obj_size
+	wr16(0)  // field0 file_entry_id（缺省）
+	wr16(0)  // field1 directory_id（缺省 -> 根目录）
+	wr16(4)  // field2 file_size
+	wr16(12) // field3 name
+	wr16(16) // field4 language_mask
+	wr16(0)  // field5（未使用）
+	wr16(0)  // field6（未使用）
+	wr16(24) // field7 chunk_ids
+	wr16(0)  // field8（未使用）
+	wr16(0)  // field9 link（缺省）
+	wr16(0)  // field10（未使用）
+	wr16(28) // field11 param_index
+	fileTablePos := len(buf)
+	fSoffset := wr32(0)
+	patch32(fSoffset, uint32(int32(fileTablePos)-int32(fileVtablePos)))
+	wr64(500) // file_size @ +4
+	fileNameRefPos := wr32(0)
+	patch32(fileNameRefPos, uint32(int32(fileNamePos)-int32(fileNameRefPos)))
+	wr64(0b10) // language_mask @ +16（bit1 = flag_id 2 = zh_CN）
+	chunkIDsRefPos := wr32(0)
+	patch32(chunkIDsRefPos, uint32(int32(chunkIDsVecPos)-int32(chunkIDsRefPos)))
+	wr8(0) // param_index @ +28
+	wr8(0) // padding ×3
+	wr8(0)
+	wr8(0)
+	fileVecPos := writeTableVector([]int{fileTablePos})
+
+	// ── Root Table：field0=bundles, field1=languages, field2=fileEntries,
+	// field5=parameters ──
+	rootVtablePos := len(buf)
+	wr16(16) // vtable_len = 4 + 6*2
+	wr16(20) // obj_size
+	wr16(4)  // field0 bundles
+	wr16(8)  // field1 languages
+	wr16(12) // field2 fileEntries
+	wr16(0)  // field3 directories（缺省）
+	wr16(0)  // field4（未使用）
+	wr16(16) // field5 parameters
+	rootTablePos := len(buf)
+	rSoffset := wr32(0)
+	patch32(rSoffset, uint32(int32(rootTablePos)-int32(rootVtablePos)))
+	bundlesRefPos := wr32(0)
+	patch32(bundlesRefPos, uint32(int32(bundleVecPos)-int32(bundlesRefPos)))
+	langsRefPos := wr32(0)
+	patch32(langsRefPos, uint32(int32(langVecPos)-int32(langsRefPos)))
+	filesRefPos := wr32(0)
+	patch32(filesRefPos, uint32(int32(fileVecPos)-int32(filesRefPos)))
+	paramsRefPos := wr32(0)
+	patch32(paramsRefPos, uint32(int32(paramVecPos)-int32(paramsRefPos)))
+
+	patch32(rootOffPlaceholder, uint32(rootTablePos))
+	return buf
+}
+
+// TestParseBytesPopulatesManifestMetadata 验证 parseBytes 将文件头版本号与
+// Body 中的 Languages/Parameters 元信息透传到 Manifest，
+// 且 FileEntry 按 param_index 关联到正确的哈希类型。
+func TestParseBytesPopulatesManifestMetadata(t *testing.T) {
+	const wantManifestID = uint64(0x1122334455667788)
+
+	body := buildFBBodyWithMetadata()
+	enc, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatalf("创建 ZSTD 编码器失败: %v", err)
+	}
+	compressed := enc.EncodeAll(body, nil)
+	enc.Close()
+
+	data := buildTestHeader(wantManifestID, 28, uint32(len(compressed)), uint32(len(body)), 2, 1)
+	data = append(data, compressed...)
+
+	m, err := parseBytes(data)
+	if err != nil {
+		t.Fatalf("parseBytes 失败: %v", err)
+	}
+
+	if m.ManifestID != wantManifestID {
+		t.Errorf("ManifestID = %016X, 期望 %016X", m.ManifestID, wantManifestID)
+	}
+	if m.MajorVersion != 2 || m.MinorVersion != 1 {
+		t.Errorf("版本 = %d.%d, 期望 2.1", m.MajorVersion, m.MinorVersion)
+	}
+
+	wantFlags := []string{"en_US", "zh_CN"}
+	if len(m.Flags) != len(wantFlags) {
+		t.Fatalf("Flags = %v, 期望 %v", m.Flags, wantFlags)
+	}
+	for i, want := range wantFlags {
+		if m.Flags[i] != want {
+			t.Errorf("Flags[%d] = %q, 期望 %q", i, m.Flags[i], want)
+		}
+	}
+
+	if len(m.Params) != 1 {
+		t.Fatalf("Params 数量 = %d, 期望 1", len(m.Params))
+	}
+	wantParams := Params{HashType: HashTypeHKDF, MinChunkSize: 4096, MaxChunkSize: 16384, MaxUncompressed: 16384}
+	if m.Params[0] != wantParams {
+		t.Errorf("Params[0] = %+v, 期望 %+v", m.Params[0], wantParams)
+	}
+
+	if len(m.Files) != 1 {
+		t.Fatalf("Files 数量 = %d, 期望 1", len(m.Files))
+	}
+	f := m.Files[0]
+	if f.Path != "root.wad" {
+		t.Errorf("Path = %q, 期望 %q", f.Path, "root.wad")
+	}
+	if f.FileSize != 500 {
+		t.Errorf("FileSize = %d, 期望 500", f.FileSize)
+	}
+	if len(f.Flags) != 1 || f.Flags[0] != "zh_CN" {
+		t.Errorf("文件 Flags = %v, 期望 [zh_CN]", f.Flags)
+	}
+	if len(f.Chunks) != 2 {
+		t.Fatalf("Chunks 数量 = %d, 期望 2", len(f.Chunks))
+	}
+	if f.Chunks[0].HashType != HashTypeHKDF {
+		t.Errorf("Chunks[0].HashType = %s, 期望 HKDF（应由 param_index=0 关联）", f.Chunks[0].HashType)
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/klauspost/compress/zstd"
@@ -73,14 +74,18 @@ func parseBytes(data []byte) (*Manifest, error) {
 	}
 
 	// 3. 解析 FlatBuffers Body
-	files, err := parseBody(body)
+	files, flags, params, err := parseBody(body)
 	if err != nil {
 		return nil, fmt.Errorf("解析 FlatBuffers Body 失败: %w", err)
 	}
 
 	return &Manifest{
-		ManifestID: hdr.ManifestID,
-		Files:      files,
+		ManifestID:   hdr.ManifestID,
+		MajorVersion: hdr.MajorVersion,
+		MinorVersion: hdr.MinorVersion,
+		Flags:        flags,
+		Params:       params,
+		Files:        files,
 	}, nil
 }
 
@@ -129,44 +134,45 @@ func parseHeader(data []byte) (*Header, error) {
 	}, nil
 }
 
-// parseBody 解析 ZSTD 解压后的 FlatBuffers Body。
-func parseBody(body []byte) (files []FileEntry, err error) {
+// parseBody 解析 ZSTD 解压后的 FlatBuffers Body，
+// 返回文件列表、清单声明的标记名列表（按 flag_id 升序）与 Parameters 表条目。
+func parseBody(body []byte) (files []FileEntry, flags []string, params []Params, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			files = nil
+			files, flags, params = nil, nil, nil
 			err = fmt.Errorf("FlatBuffers Body 格式无效: %v", r)
 		}
 	}()
 
 	if len(body) < 4 {
-		return nil, fmt.Errorf("FlatBuffers Body 过短：%d 字节", len(body))
+		return nil, nil, nil, fmt.Errorf("FlatBuffers Body 过短：%d 字节", len(body))
 	}
 
 	// FlatBuffers 根对象偏移
 	rootOffset := fbRootOffset(body)
 	if rootOffset+4 > uint32(len(body)) {
-		return nil, fmt.Errorf("FlatBuffers root offset 越界: offset=%d len=%d", rootOffset, len(body))
+		return nil, nil, nil, fmt.Errorf("FlatBuffers root offset 越界: offset=%d len=%d", rootOffset, len(body))
 	}
 
 	// 解析 Parameters 列表（field index 5）
 	// 需要先解析 parameters，因为 FileEntry 通过 param_index 引用哈希类型
-	params, err := parseParameters(body, rootOffset)
+	params, err = parseParameters(body, rootOffset)
 	if err != nil {
-		return nil, fmt.Errorf("解析 Parameters 失败: %w", err)
+		return nil, nil, nil, fmt.Errorf("解析 Parameters 失败: %w", err)
 	}
 
 	// 解析 Language 列表（field index 1）
 	// 建立 langMap: index(0-based) -> name，用于 language_mask 解码
 	langMap, err := parseLanguages(body, rootOffset)
 	if err != nil {
-		return nil, fmt.Errorf("解析 Languages 失败: %w", err)
+		return nil, nil, nil, fmt.Errorf("解析 Languages 失败: %w", err)
 	}
 
 	// 解析 Directory 列表（field index 3）
 	// 建立 dirMap: directory_id -> dirEntry，用于路径重建
 	dirMap, err := parseDirectories(body, rootOffset)
 	if err != nil {
-		return nil, fmt.Errorf("解析 Directories 失败: %w", err)
+		return nil, nil, nil, fmt.Errorf("解析 Directories 失败: %w", err)
 	}
 
 	// 解析 Bundle 列表（field index 0）
@@ -174,30 +180,41 @@ func parseBody(body []byte) (files []FileEntry, err error) {
 	// 关键：bundle_offset 在此阶段通过累加 compressed_size 推算
 	chunkMap, err := parseBundles(body, rootOffset)
 	if err != nil {
-		return nil, fmt.Errorf("解析 Bundles 失败: %w", err)
+		return nil, nil, nil, fmt.Errorf("解析 Bundles 失败: %w", err)
 	}
 
 	// 解析 FileEntry 列表（field index 2）
 	files, err = parseFileEntries(body, rootOffset, chunkMap, dirMap, langMap, params)
 	if err != nil {
-		return nil, fmt.Errorf("解析 FileEntries 失败: %w", err)
+		return nil, nil, nil, fmt.Errorf("解析 FileEntries 失败: %w", err)
 	}
 
-	return files, nil
+	// langMap 键为 bit index（= flag_id-1），按其升序还原声明顺序
+	bits := make([]int, 0, len(langMap))
+	for bit := range langMap {
+		bits = append(bits, bit)
+	}
+	sort.Ints(bits)
+	flags = make([]string, 0, len(bits))
+	for _, bit := range bits {
+		flags = append(flags, langMap[bit])
+	}
+
+	return files, flags, params, nil
 }
 
 // parseParameters 解析根对象的 parameters 字段（field index 5）。
 // Parameters 对象包含哈希类型、分块大小参数。
-func parseParameters(body []byte, rootOffset uint32) ([]parameters, error) {
+func parseParameters(body []byte, rootOffset uint32) ([]Params, error) {
 	dataStart, count := fbVectorInfo(body, rootOffset, 5)
 	if count == 0 {
 		return nil, nil
 	}
 
-	params := make([]parameters, count)
+	params := make([]Params, count)
 	for i := uint32(0); i < count; i++ {
 		tableOffset := fbVectorTableAt(body, dataStart, i)
-		params[i] = parameters{
+		params[i] = Params{
 			HashType:        HashType(fbReadUint8(body, tableOffset, 1, 0)),
 			MinChunkSize:    fbReadUint32(body, tableOffset, 2, 0),
 			MaxChunkSize:    fbReadUint32(body, tableOffset, 3, 0),
@@ -312,7 +329,7 @@ func parseFileEntries(
 	chunkMap map[uint64]*ChunkInfo,
 	dirMap map[uint64]dirEntry,
 	langMap map[int]string,
-	params []parameters,
+	params []Params,
 ) ([]FileEntry, error) {
 	dataStart, count := fbVectorInfo(body, rootOffset, 2)
 	if count == 0 {

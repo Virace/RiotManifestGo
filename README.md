@@ -89,6 +89,7 @@ go build -o manifest-cli ./cmd/manifest-cli/
 | `-v` | 输出等级（0=进度条, 1-3=递增详细度） | `0` |
 | `-log` | 保存下载日志 | - |
 | `-retry` | Bundle 下载失败最大重试次数 | `3` |
+| `-retry-wait` | 重试指数退避基础等待，第 N 次重试前等待 base×2^(N-1)，单次封顶 60s 与 base 中较大者 | `1s` |
 | `-update` | 旧清单路径，用于增量更新比对（缺省时自动从本地存档发现） | - |
 | `-repair` | 修复模式：逐文件重新校验并补齐本地缺失/损坏的内容，不做文件级跳过 | `false` |
 | `-verify-only` | 仅校验本地文件完整性，不下载、不写盘 | `false` |
@@ -96,6 +97,16 @@ go build -o manifest-cli ./cmd/manifest-cli/
 | `-keep-removed` | 保留旧清单中已不存在的文件，以及重命名文件的旧路径副本，不清理磁盘（默认清理） | `false` |
 
 `-repair`、`-verify-only`、`-no-verify` 两两互斥，同时指定多个会报错退出。
+
+### 暂态 404 / CDN 冷对象
+
+个别 CDN（实测如腾讯 `cdn.val.qq.com`）对长期无人访问的历史 bundle 会出现暂态 404 或高并发限流断连：对象本身存在，但边缘节点缓存已淘汰，回源暖起来需要几十秒。默认的重试窗口（1s/2s/4s）对这种场景太短，可以拉长重试节奏并降低并发：
+
+```bash
+manifest-cli old.manifest -o ./output -retry 5 -retry-wait 4s -w 8
+```
+
+`-retry 5 -retry-wait 4s` 的等待序列为 4s/8s/16s/32s/60s，总计约 2 分钟，足以覆盖多数回源暖化；`-w` 降低并发可减少限流导致的连接强制断开（`connection forcibly closed`）。
 
 ## 更新模式
 

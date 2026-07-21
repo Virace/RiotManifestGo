@@ -43,6 +43,7 @@ func main() {
 	listLimit := flag.Int("n", 20, "列表模式下最大显示数量（-1=全部）")
 	logFile := flag.String("log", "", "下载完毕保存完整日志到指定文件")
 	maxRetries := flag.Int("retry", 3, "单个 Bundle 下载失败最大重试次数")
+	retryWait := flag.Duration("retry-wait", time.Second, "重试指数退避基础等待，第 N 次重试前等待 base×2^(N-1)（单次封顶 60s 与 base 较大者；CDN 冷对象 404 可调大，如 4s）")
 	silent := flag.Bool("s", false, "静默模式，仅输出错误")
 	verbose := flag.Int("v", 0, "详细输出等级（0=默认进度条, 1=基础滚屏, 2=详细, 3=调试）")
 	showVersion := flag.Bool("version", false, "显示程序版本信息并退出")
@@ -154,6 +155,7 @@ func main() {
 		MaxRangesPerReq: 30,
 		GapTolerance:    core.DefaultGapTolerance,
 		MaxRetries:      *maxRetries,
+		RetryWait:       *retryWait,
 	})
 
 	dlLog := &downloadLog{startTime: time.Now(), files: files}
@@ -291,8 +293,8 @@ func consumeEvents(events <-chan core.DownloadEvent, dl *downloadLog, printer *o
 			dl.mu.Lock()
 			dl.retries++
 			dl.mu.Unlock()
-			fmt.Fprintf(os.Stderr, "  🔄 重试 Bundle %s (%d/%d): %v\n",
-				e.BundleFilename, e.Attempt, e.MaxRetries, e.Err)
+			fmt.Fprintf(os.Stderr, "  🔄 重试 Bundle %s (%d/%d, 等待 %s): %v\n",
+				e.BundleFilename, e.Attempt, e.MaxRetries, e.Wait, e.Err)
 
 		case core.EventError:
 			dl.mu.Lock()
@@ -762,7 +764,7 @@ func extractManifestArg(args []string) (manifest string, remaining []string) {
 	flagsWithValue := map[string]bool{
 		"-o": true, "-u": true, "-p": true, "-f": true,
 		"-w": true, "-n": true, "-log": true, "-retry": true, "-v": true,
-		"-update": true,
+		"-update": true, "-retry-wait": true,
 	}
 
 	remaining = make([]string, 0, len(args))

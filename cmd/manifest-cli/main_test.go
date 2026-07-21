@@ -123,12 +123,12 @@ func TestBuildSyncOptionsPassesThroughUpdatePath(t *testing.T) {
 // ---- extractManifestArg：-update 需要消费其后的值 ----
 
 func TestExtractManifestArgConsumesUpdateFlagValue(t *testing.T) {
-	args := []string{"game.manifest", "-update", "old.manifest", "-o", "./output"}
+	args := []string{"game.manifest", "-update", "old.manifest", "-o", "./output", "-retry-wait", "4s"}
 	manifest, remaining := extractManifestArg(args)
 	if manifest != "game.manifest" {
 		t.Errorf("manifest = %q, want game.manifest", manifest)
 	}
-	want := []string{"-update", "old.manifest", "-o", "./output"}
+	want := []string{"-update", "old.manifest", "-o", "./output", "-retry-wait", "4s"}
 	if len(remaining) != len(want) {
 		t.Fatalf("remaining = %v, want %v", remaining, want)
 	}

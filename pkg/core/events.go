@@ -52,7 +52,9 @@ type EventRetry struct {
 	BundleFilename string
 	Attempt        int
 	MaxRetries     int
-	Err            error
+	// Wait 本次重试前的退避等待时长
+	Wait time.Duration
+	Err  error
 }
 
 // EventError 在处理 Bundle 出错时发出（已耗尽重试次数）。

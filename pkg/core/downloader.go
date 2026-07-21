@@ -53,6 +53,11 @@ type DownloadConfig struct {
 
 	// MaxRetries 单个 BundleJob 失败时的最大重试次数（默认 3；负数表示不重试）
 	MaxRetries int
+
+	// RetryWait 重试指数退避的基础等待时长（默认 1s）：第 N 次重试前等待
+	// RetryWait × 2^(N-1)，单次等待封顶 maxRetryWait 与 RetryWait 中的较大者。
+	// CDN 冷对象回源（暂态 404）场景可调大该值拉长重试窗口。
+	RetryWait time.Duration
 }
 
 // Downloader 是下载管线的顶层协调器。
@@ -93,6 +98,9 @@ func newDownloader(config DownloadConfig, fetcher BundleFetcher) *Downloader {
 	}
 	if config.MaxRetries == 0 {
 		config.MaxRetries = 3
+	}
+	if config.RetryWait <= 0 {
+		config.RetryWait = time.Second
 	}
 
 	return &Downloader{
@@ -387,10 +395,34 @@ func (d *Downloader) taskWorker(
 	}
 }
 
+// maxRetryWait 重试等待时长的默认上限，防止指数增长失控；
+// 基础等待被配置得比它还大时以基础等待为准（见 retryWait）。
+const maxRetryWait = 60 * time.Second
+
+// retryWait 计算第 attempt 次重试（1-based）前的指数退避等待时长：
+// base × 2^(attempt-1)，封顶 maxRetryWait 与 base 中的较大者。
+func retryWait(base time.Duration, attempt int) time.Duration {
+	if base <= 0 {
+		base = time.Second
+	}
+	limit := maxRetryWait
+	if base > limit {
+		limit = base
+	}
+	wait := base
+	for i := 1; i < attempt; i++ {
+		wait *= 2
+		if wait >= limit {
+			return limit
+		}
+	}
+	return wait
+}
+
 // processBundleWithRetry 带重试策略执行 BundleJob。
 //
 // Chunk 级重试：单个 BundleJob 失败时只重试该 Job，不回滚全局。
-// 指数退避：第 N 次重试等待 N 秒。
+// 指数退避：第 N 次重试前等待 retryWait(RetryWait, N)。
 // 不做断点续传：manifest 无文件级校验信息，续传容易导致文件错误。
 func (d *Downloader) processBundleWithRetry(ctx context.Context, job BundleJob) error {
 	var lastErr error
@@ -400,16 +432,17 @@ func (d *Downloader) processBundleWithRetry(ctx context.Context, job BundleJob) 
 	}
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
+			wait := retryWait(d.config.RetryWait, attempt)
 			d.emit(EventRetry{
 				BundleID:       job.BundleID,
 				BundleFilename: job.BundleFilename,
 				Attempt:        attempt,
 				MaxRetries:     maxRetries,
+				Wait:           wait,
 				Err:            lastErr,
 			})
-			// 指数退避
 			select {
-			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-time.After(wait):
 			case <-ctx.Done():
 				return ctx.Err()
 			}

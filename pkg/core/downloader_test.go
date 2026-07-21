@@ -280,6 +280,7 @@ func TestDownload_FanoutWrite(t *testing.T) {
 func TestDownload_RetryOnFailure(t *testing.T) {
 	config, dir := makeTestConfig(t)
 	config.MaxRetries = 3
+	config.RetryWait = 10 * time.Millisecond
 
 	const bundleID uint64 = 0xCC00000000000001
 	chunkData := []byte("retry test data")
@@ -293,14 +294,14 @@ func TestDownload_RetryOnFailure(t *testing.T) {
 	dl := NewDownloaderWithFetcher(config, mock)
 	events := dl.Events()
 
-	var retryCount int
+	var waits []time.Duration
 	var eventWg sync.WaitGroup
 	eventWg.Add(1)
 	go func() {
 		defer eventWg.Done()
 		for ev := range events {
-			if _, ok := ev.(EventRetry); ok {
-				retryCount++
+			if r, ok := ev.(EventRetry); ok {
+				waits = append(waits, r.Wait)
 			}
 		}
 	}()
@@ -312,8 +313,15 @@ func TestDownload_RetryOnFailure(t *testing.T) {
 		t.Fatalf("Download 应在重试后成功，但失败: %v", err)
 	}
 
-	if retryCount != 2 {
-		t.Errorf("期望 2 次 EventRetry，实际 %d 次", retryCount)
+	// 退避等待应按 base×2^(N-1) 指数增长
+	wantWaits := []time.Duration{10 * time.Millisecond, 20 * time.Millisecond}
+	if len(waits) != len(wantWaits) {
+		t.Fatalf("期望 %d 次 EventRetry，实际 %d 次", len(wantWaits), len(waits))
+	}
+	for i, want := range wantWaits {
+		if waits[i] != want {
+			t.Errorf("第 %d 次重试 Wait = %v，期望 %v", i+1, waits[i], want)
+		}
 	}
 
 	// 验证文件内容
@@ -1027,5 +1035,37 @@ func TestFailedFileKeepsOldAndDiscardsStaging(t *testing.T) {
 
 	if _, statErr := os.Stat(fswriter.StagingPath(targetPath)); !os.IsNotExist(statErr) {
 		t.Errorf("失败后暂存文件应已被丢弃, stat err=%v", statErr)
+	}
+}
+
+// ---- retryWait 指数退避计算 ----
+
+func TestRetryWaitExponentialGrowthWithCap(t *testing.T) {
+	cases := []struct {
+		base    time.Duration
+		attempt int
+		want    time.Duration
+	}{
+		{time.Second, 1, time.Second},
+		{time.Second, 2, 2 * time.Second},
+		{time.Second, 3, 4 * time.Second},
+		{4 * time.Second, 4, 32 * time.Second},
+		{4 * time.Second, 5, 60 * time.Second}, // 4s×2^4=64s，封顶 maxRetryWait
+		{2 * time.Minute, 1, 2 * time.Minute},  // base 大于默认上限时以 base 为上限
+		{2 * time.Minute, 3, 2 * time.Minute},
+		{0, 1, time.Second},                  // 非法 base 兜底 1s
+		{time.Second, 100, 60 * time.Second}, // 大 attempt 不溢出，稳定封顶
+	}
+	for _, c := range cases {
+		if got := retryWait(c.base, c.attempt); got != c.want {
+			t.Errorf("retryWait(%v, %d) = %v，期望 %v", c.base, c.attempt, got, c.want)
+		}
+	}
+}
+
+func TestNewDownloaderDefaultRetryWait(t *testing.T) {
+	dl := NewDownloaderWithFetcher(DownloadConfig{}, newMockFetcher())
+	if dl.config.RetryWait != time.Second {
+		t.Errorf("RetryWait 零值应默认 1s，实际 %v", dl.config.RetryWait)
 	}
 }

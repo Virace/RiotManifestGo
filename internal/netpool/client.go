@@ -49,7 +49,15 @@ type ClientConfig struct {
 }
 
 // NewBundleClient 创建一个新的 Bundle HTTP 客户端。
+//
+// cfg.BaseURLs 不能为空：FetchRanges 按 URLHint % len(BaseURLs) 选取域名，
+// 空列表会导致运行时对 0 取模 panic。这是一个编程错误前置条件，调用方必须
+// 在归一化阶段保证至少提供一个 BaseURL（core.NewDownloader 即如此处理）。
 func NewBundleClient(cfg ClientConfig) *BundleClient {
+	if len(cfg.BaseURLs) == 0 {
+		panic("netpool: BaseURLs 不能为空")
+	}
+
 	baseURLs := make([]string, len(cfg.BaseURLs))
 	for i, u := range cfg.BaseURLs {
 		baseURLs[i] = strings.TrimRight(u, "/")

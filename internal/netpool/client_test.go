@@ -699,6 +699,18 @@ func TestDialContextInjected(t *testing.T) {
 	}
 }
 
+// TestNewBundleClientEmptyBaseURLsPanics 验证 BaseURLs 为空时 NewBundleClient
+// 显式 panic，而不是留到 FetchRanges 内部因 URLHint % 0 才崩溃：这是一个编程
+// 错误前置条件，调用方（core.NewDownloader）必须保证归一化后的 BaseURLs 非空。
+func TestNewBundleClientEmptyBaseURLsPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewBundleClient 对空 BaseURLs 应 panic，实际未 panic")
+		}
+	}()
+	NewBundleClient(ClientConfig{BaseURLs: nil, Workers: 2})
+}
+
 // ---- 内部解析函数测试 ----
 
 // TestParseMultipartResponse 验证 multipart 解析边界情况。

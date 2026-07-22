@@ -24,7 +24,7 @@ func (a *netBundleFetcherAdapter) FetchRanges(ctx context.Context, bundleFilenam
 	for i, r := range ranges {
 		npRanges[i] = netpool.ByteRange{Start: r.Start, End: r.End}
 	}
-	return a.client.FetchRanges(ctx, bundleFilename, npRanges)
+	return a.client.FetchRanges(ctx, bundleFilename, npRanges, netpool.FetchOptions{})
 }
 
 func (a *netBundleFetcherAdapter) Close() {
@@ -75,7 +75,7 @@ type Downloader struct {
 // NewDownloader 创建一个新的下载协调器。
 func NewDownloader(config DownloadConfig) *Downloader {
 	client := &netBundleFetcherAdapter{
-		client: netpool.NewBundleClient(config.CDNBaseURL, config.Workers),
+		client: netpool.NewBundleClient(netpool.ClientConfig{BaseURLs: []string{config.CDNBaseURL}, Workers: config.Workers}),
 	}
 	return newDownloader(config, client)
 }

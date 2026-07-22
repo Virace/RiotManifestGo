@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -136,12 +138,12 @@ func TestFetchRanges_SingleRange(t *testing.T) {
 	srv := httptest.NewServer(cdn)
 	defer srv.Close()
 
-	client := NewBundleClient(srv.URL, 2)
+	client := NewBundleClient(ClientConfig{BaseURLs: []string{srv.URL}, Workers: 2})
 	defer client.Close()
 
 	result, err := client.FetchRanges(context.Background(), "test.bundle", []ByteRange{
 		{Start: 0, End: 3}, // "0123"
-	})
+	}, FetchOptions{})
 	if err != nil {
 		t.Fatalf("FetchRanges 失败: %v", err)
 	}
@@ -162,13 +164,13 @@ func TestFetchRanges_MultiRange(t *testing.T) {
 	srv := httptest.NewServer(cdn)
 	defer srv.Close()
 
-	client := NewBundleClient(srv.URL, 2)
+	client := NewBundleClient(ClientConfig{BaseURLs: []string{srv.URL}, Workers: 2})
 	defer client.Close()
 
 	result, err := client.FetchRanges(context.Background(), "multi.bundle", []ByteRange{
 		{Start: 0, End: 3},   // "0123"
 		{Start: 10, End: 13}, // "ABCD"
-	})
+	}, FetchOptions{})
 	if err != nil {
 		t.Fatalf("FetchRanges 失败: %v", err)
 	}
@@ -205,13 +207,13 @@ func TestFetchRanges_MultiRangeCloudFrontBoundary(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewBundleClient(srv.URL, 1)
+	client := NewBundleClient(ClientConfig{BaseURLs: []string{srv.URL}, Workers: 1})
 	defer client.Close()
 
 	result, err := client.FetchRanges(context.Background(), "cloudfront.bundle", []ByteRange{
 		{Start: 0, End: 3},
 		{Start: 10, End: 13},
-	})
+	}, FetchOptions{})
 	if err != nil {
 		t.Fatalf("FetchRanges 失败: %v", err)
 	}
@@ -255,7 +257,7 @@ func TestFetchRangesFallsBackFromSinglePartForMultiRange(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewBundleClient(srv.URL, 2)
+	client := NewBundleClient(ClientConfig{BaseURLs: []string{srv.URL}, Workers: 2})
 	defer client.Close()
 
 	ranges := []ByteRange{
@@ -263,7 +265,7 @@ func TestFetchRangesFallsBackFromSinglePartForMultiRange(t *testing.T) {
 		{Start: 10, End: 13},
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		result, err := client.FetchRanges(context.Background(), "fallback.bundle", ranges)
+		result, err := client.FetchRanges(context.Background(), "fallback.bundle", ranges, FetchOptions{})
 		if err != nil {
 			t.Fatalf("第 %d 次 FetchRanges 失败: %v", attempt+1, err)
 		}
@@ -316,13 +318,13 @@ func TestFetchRangesFallbackUsesFullBodyOnce(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewBundleClient(srv.URL, 2)
+	client := NewBundleClient(ClientConfig{BaseURLs: []string{srv.URL}, Workers: 2})
 	defer client.Close()
 
 	result, err := client.FetchRanges(context.Background(), "full-fallback.bundle", []ByteRange{
 		{Start: 0, End: 3},
 		{Start: 10, End: 13},
-	})
+	}, FetchOptions{})
 	if err != nil {
 		t.Fatalf("FetchRanges 失败: %v", err)
 	}
@@ -357,13 +359,14 @@ func TestFetchRangesRejectsInvalidSingleRangeMetadata(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			client := NewBundleClient(srv.URL, 1)
+			client := NewBundleClient(ClientConfig{BaseURLs: []string{srv.URL}, Workers: 1})
 			defer client.Close()
 
 			_, err := client.FetchRanges(
 				context.Background(),
 				"invalid.bundle",
 				[]ByteRange{{Start: 0, End: 3}},
+				FetchOptions{},
 			)
 			if err == nil {
 				t.Fatal("无效单 Range 元数据应返回 error")
@@ -382,13 +385,13 @@ func TestFetchRanges_FullBody200(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewBundleClient(srv.URL, 2)
+	client := NewBundleClient(ClientConfig{BaseURLs: []string{srv.URL}, Workers: 2})
 	defer client.Close()
 
 	result, err := client.FetchRanges(context.Background(), "full.bundle", []ByteRange{
 		{Start: 0, End: 3},   // "0123"
 		{Start: 10, End: 13}, // "ABCD"
-	})
+	}, FetchOptions{})
 	if err != nil {
 		t.Fatalf("FetchRanges 失败: %v", err)
 	}
@@ -412,12 +415,12 @@ func TestFetchRanges_416Error(t *testing.T) {
 	srv := httptest.NewServer(cdn)
 	defer srv.Close()
 
-	client := NewBundleClient(srv.URL, 2)
+	client := NewBundleClient(ClientConfig{BaseURLs: []string{srv.URL}, Workers: 2})
 	defer client.Close()
 
 	_, err := client.FetchRanges(context.Background(), "any.bundle", []ByteRange{
 		{Start: 0, End: 999},
-	})
+	}, FetchOptions{})
 	if err == nil {
 		t.Fatal("CDN 返回 416 时应返回 error")
 	}
@@ -434,12 +437,12 @@ func TestFetchRanges_ServerError(t *testing.T) {
 	srv := httptest.NewServer(cdn)
 	defer srv.Close()
 
-	client := NewBundleClient(srv.URL, 2)
+	client := NewBundleClient(ClientConfig{BaseURLs: []string{srv.URL}, Workers: 2})
 	defer client.Close()
 
 	_, err := client.FetchRanges(context.Background(), "error.bundle", []ByteRange{
 		{Start: 0, End: 10},
-	})
+	}, FetchOptions{})
 	if err == nil {
 		t.Fatal("CDN 返回 500 时应返回 error")
 	}
@@ -447,10 +450,10 @@ func TestFetchRanges_ServerError(t *testing.T) {
 
 // TestFetchRanges_Empty 验证空 ranges 返回 nil。
 func TestFetchRanges_Empty(t *testing.T) {
-	client := NewBundleClient("http://unused", 2)
+	client := NewBundleClient(ClientConfig{BaseURLs: []string{"http://unused"}, Workers: 2})
 	defer client.Close()
 
-	result, err := client.FetchRanges(context.Background(), "any.bundle", nil)
+	result, err := client.FetchRanges(context.Background(), "any.bundle", nil, FetchOptions{})
 	if err != nil {
 		t.Fatalf("空 ranges 不应返回 error: %v", err)
 	}
@@ -541,14 +544,14 @@ func TestFetchRanges_ContextCancel(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewBundleClient(srv.URL, 2)
+	client := NewBundleClient(ClientConfig{BaseURLs: []string{srv.URL}, Workers: 2})
 	defer client.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := client.FetchRanges(ctx, "slow.bundle", []ByteRange{{Start: 0, End: 99}})
+		_, err := client.FetchRanges(ctx, "slow.bundle", []ByteRange{{Start: 0, End: 99}}, FetchOptions{})
 		done <- err
 	}()
 
@@ -563,6 +566,136 @@ func TestFetchRanges_ContextCancel(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("FetchRanges 在 context cancel 后 3 秒内未退出")
+	}
+}
+
+// TestURLHintSelectsBaseURL 验证多 BaseURLs 时按 URLHint % len(BaseURLs) 取模选取域名。
+func TestURLHintSelectsBaseURL(t *testing.T) {
+	data := []byte("0123456789ABCDEF")
+
+	var hitCount [2]int
+	newServer := func(idx int) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hitCount[idx]++
+			w.WriteHeader(http.StatusOK)
+			w.Write(data)
+		}))
+	}
+	srv0 := newServer(0)
+	defer srv0.Close()
+	srv1 := newServer(1)
+	defer srv1.Close()
+
+	client := NewBundleClient(ClientConfig{
+		BaseURLs: []string{srv0.URL, srv1.URL},
+		Workers:  2,
+	})
+	defer client.Close()
+
+	cases := []struct {
+		hint    uint64
+		wantIdx int
+	}{
+		{hint: 0, wantIdx: 0},
+		{hint: 1, wantIdx: 1},
+		{hint: 2, wantIdx: 0},
+	}
+
+	for _, tc := range cases {
+		hitCount[0], hitCount[1] = 0, 0
+		_, err := client.FetchRanges(context.Background(), "hint.bundle", []ByteRange{{Start: 0, End: 3}}, FetchOptions{URLHint: tc.hint})
+		if err != nil {
+			t.Fatalf("URLHint=%d FetchRanges 失败: %v", tc.hint, err)
+		}
+		if hitCount[tc.wantIdx] != 1 {
+			t.Errorf("URLHint=%d 期望命中 server[%d]，实际计数=%v", tc.hint, tc.wantIdx, hitCount)
+		}
+	}
+}
+
+// TestFullBundleSendsNoRangeHeader 验证 FullBundleSize>0 时不携带 Range 头，
+// 且 200 全体响应能按 ranges 正确切片。
+func TestFullBundleSendsNoRangeHeader(t *testing.T) {
+	data := []byte("0123456789ABCDEF")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+			t.Errorf("整包 GET 不应携带 Range 头，实际=%q", rangeHeader)
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+	}))
+	defer srv.Close()
+
+	client := NewBundleClient(ClientConfig{BaseURLs: []string{srv.URL}, Workers: 2})
+	defer client.Close()
+
+	result, err := client.FetchRanges(context.Background(), "full.bundle", []ByteRange{
+		{Start: 0, End: 3},   // "0123"
+		{Start: 10, End: 13}, // "ABCD"
+	}, FetchOptions{FullBundleSize: int64(len(data))})
+	if err != nil {
+		t.Fatalf("FetchRanges 失败: %v", err)
+	}
+
+	if len(result) != 2 {
+		t.Fatalf("期望 2 段结果，得到 %d", len(result))
+	}
+	if string(result[0]) != "0123" {
+		t.Errorf("Range[0] 数据不匹配: %q", result[0])
+	}
+	if string(result[1]) != "ABCD" {
+		t.Errorf("Range[1] 数据不匹配: %q", result[1])
+	}
+}
+
+// TestFullBundleRejects206 验证整包 GET 模式下收到 206 时报错（不发 Range 头不应收到 206）。
+func TestFullBundleRejects206(t *testing.T) {
+	data := []byte("0123456789ABCDEF")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(data)
+	}))
+	defer srv.Close()
+
+	client := NewBundleClient(ClientConfig{BaseURLs: []string{srv.URL}, Workers: 2})
+	defer client.Close()
+
+	_, err := client.FetchRanges(context.Background(), "full.bundle", []ByteRange{
+		{Start: 0, End: 3},
+	}, FetchOptions{FullBundleSize: int64(len(data))})
+	if err == nil {
+		t.Fatal("整包 GET 收到 206 时应返回 error")
+	}
+}
+
+// TestDialContextInjected 验证 ClientConfig.DialContext 非 nil 时被用于建立连接。
+func TestDialContextInjected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("0123456789ABCDEF"))
+	}))
+	defer srv.Close()
+
+	var called int32
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		atomic.AddInt32(&called, 1)
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+
+	client := NewBundleClient(ClientConfig{
+		BaseURLs:    []string{srv.URL},
+		Workers:     2,
+		DialContext: dial,
+	})
+	defer client.Close()
+
+	_, err := client.FetchRanges(context.Background(), "dial.bundle", []ByteRange{{Start: 0, End: 3}}, FetchOptions{})
+	if err != nil {
+		t.Fatalf("FetchRanges 失败: %v", err)
+	}
+	if atomic.LoadInt32(&called) == 0 {
+		t.Error("自定义 DialContext 未被调用")
 	}
 }
 

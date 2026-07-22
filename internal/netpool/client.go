@@ -26,27 +26,48 @@ import (
 //   - 兼容 CloudFront 未加引号的 multipart boundary
 //   - 多 Range 只返回部分数据时顺序补齐缺失段
 //   - 动态超时（基于请求数据量）
+//   - 多 BaseURL，按请求携带的 URLHint 取模选取
 type BundleClient struct {
 	httpClient        *http.Client
-	baseURL           string
+	baseURLs          []string
 	preferSingleRange atomic.Bool
 }
 
-// NewBundleClient 创建一个新的 Bundle HTTP 客户端。
-//
-// baseURL 格式示例："https://lol.dyn.riotcdn.net/channels/public/bundles"
-// workers 指定并发 Worker 数量，用于配置连接池大小。
-func NewBundleClient(baseURL string, workers int) *BundleClient {
-	baseURL = strings.TrimRight(baseURL, "/")
+// ClientConfig 是 NewBundleClient 的构造配置。
+type ClientConfig struct {
+	// BaseURLs 是候选的 CDN 基础 URL 列表（至少一个），格式示例：
+	// "https://lol.dyn.riotcdn.net/channels/public/bundles"。
+	// 构造时逐个 TrimRight "/"；多个时由 FetchOptions.URLHint 取模选取。
+	BaseURLs []string
 
-	transport := &http.Transport{
-		MaxIdleConns:        workers * 2,
-		MaxIdleConnsPerHost: workers * 2,
-		IdleConnTimeout:     90 * time.Second,
-		DialContext: (&net.Dialer{
+	// Workers 指定并发 Worker 数量，用于配置连接池大小。
+	Workers int
+
+	// DialContext 自定义拨号函数，用于替换连接建立逻辑（如 edge 层接管连接）。
+	// 为 nil 时使用默认 net.Dialer{Timeout: 30s, KeepAlive: 30s}。
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// NewBundleClient 创建一个新的 Bundle HTTP 客户端。
+func NewBundleClient(cfg ClientConfig) *BundleClient {
+	baseURLs := make([]string, len(cfg.BaseURLs))
+	for i, u := range cfg.BaseURLs {
+		baseURLs[i] = strings.TrimRight(u, "/")
+	}
+
+	dialContext := cfg.DialContext
+	if dialContext == nil {
+		dialContext = (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		}).DialContext
+	}
+
+	transport := &http.Transport{
+		MaxIdleConns:        cfg.Workers * 2,
+		MaxIdleConnsPerHost: cfg.Workers * 2,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext:         dialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
 		// Bundle 数据已是 ZSTD 压缩，禁用 HTTP 层压缩避免双重压缩
 		DisableCompression: true,
@@ -57,7 +78,7 @@ func NewBundleClient(baseURL string, workers int) *BundleClient {
 			Transport: transport,
 			// 不设全局超时，改用 per-request context 动态超时
 		},
-		baseURL: baseURL,
+		baseURLs: baseURLs,
 	}
 }
 
@@ -65,6 +86,16 @@ func NewBundleClient(baseURL string, workers int) *BundleClient {
 type ByteRange struct {
 	Start int64
 	End   int64
+}
+
+// FetchOptions 控制单次 FetchRanges 请求的域名选取与整包模式。
+type FetchOptions struct {
+	// URLHint 决定本次请求选用的 BaseURL：BaseURLs[URLHint % len(BaseURLs)]。
+	URLHint uint64
+
+	// FullBundleSize 大于 0 时启用整包 GET 模式：不发 Range 头，请求 Bundle 全体
+	// 内容，动态超时按该字节数计算；等于 0 时走既有 Range 请求分支。
+	FullBundleSize int64
 }
 
 // FetchRanges 从 CDN 获取指定 Bundle 的多个字节范围。
@@ -75,12 +106,18 @@ type ByteRange struct {
 //   - 上限 10 分钟
 //
 // 返回的 [][]byte 与 ranges 一一对应。
-func (c *BundleClient) FetchRanges(ctx context.Context, bundleFilename string, ranges []ByteRange) ([][]byte, error) {
+func (c *BundleClient) FetchRanges(ctx context.Context, bundleFilename string, ranges []ByteRange, opts FetchOptions) ([][]byte, error) {
 	if len(ranges) == 0 {
 		return nil, nil
 	}
 
-	url := c.baseURL + "/" + bundleFilename
+	baseURL := c.baseURLs[opts.URLHint%uint64(len(c.baseURLs))]
+	url := baseURL + "/" + bundleFilename
+
+	if opts.FullBundleSize > 0 {
+		return c.fetchFullBundle(ctx, url, bundleFilename, ranges, opts.FullBundleSize)
+	}
+
 	rangeHeader := buildRangeHeader(ranges)
 
 	// 计算动态超时
@@ -234,6 +271,37 @@ func (c *BundleClient) fetchSingleRanges(
 	}
 
 	return results, nil
+}
+
+// fetchFullBundle 以整包 GET 方式获取 Bundle 全部内容（不发 Range 头），
+// 再从响应体中切出 ranges 对应的片段。仅接受 200：不发 Range 头的请求不应
+// 收到 206，收到即视为响应异常。
+func (c *BundleClient) fetchFullBundle(ctx context.Context, url, bundleFilename string, ranges []ByteRange, fullBundleSize int64) ([][]byte, error) {
+	timeout := dynamicTimeout(fullBundleSize)
+
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建 HTTP 请求失败: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP 请求失败 (%s): %w", bundleFilename, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("整包 GET 响应异常 (%s): status=%d", bundleFilename, resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取完整响应失败: %w", err)
+	}
+	return extractFromFullBody(body, ranges)
 }
 
 // Close 关闭 HTTP 客户端的空闲连接。

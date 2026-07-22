@@ -74,7 +74,7 @@ func parseBytes(data []byte) (*Manifest, error) {
 	}
 
 	// 3. 解析 FlatBuffers Body
-	files, flags, params, err := parseBody(body)
+	files, flags, params, bundleSizes, err := parseBody(body)
 	if err != nil {
 		return nil, fmt.Errorf("解析 FlatBuffers Body 失败: %w", err)
 	}
@@ -86,6 +86,7 @@ func parseBytes(data []byte) (*Manifest, error) {
 		Flags:        flags,
 		Params:       params,
 		Files:        files,
+		BundleSizes:  bundleSizes,
 	}, nil
 }
 
@@ -135,58 +136,59 @@ func parseHeader(data []byte) (*Header, error) {
 }
 
 // parseBody 解析 ZSTD 解压后的 FlatBuffers Body，
-// 返回文件列表、清单声明的标记名列表（按 flag_id 升序）与 Parameters 表条目。
-func parseBody(body []byte) (files []FileEntry, flags []string, params []Params, err error) {
+// 返回文件列表、清单声明的标记名列表（按 flag_id 升序）、Parameters 表条目，
+// 以及 bundleID -> 总压缩大小的映射。
+func parseBody(body []byte) (files []FileEntry, flags []string, params []Params, bundleSizes map[uint64]uint32, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			files, flags, params = nil, nil, nil
+			files, flags, params, bundleSizes = nil, nil, nil, nil
 			err = fmt.Errorf("FlatBuffers Body 格式无效: %v", r)
 		}
 	}()
 
 	if len(body) < 4 {
-		return nil, nil, nil, fmt.Errorf("FlatBuffers Body 过短：%d 字节", len(body))
+		return nil, nil, nil, nil, fmt.Errorf("FlatBuffers Body 过短：%d 字节", len(body))
 	}
 
 	// FlatBuffers 根对象偏移
 	rootOffset := fbRootOffset(body)
 	if rootOffset+4 > uint32(len(body)) {
-		return nil, nil, nil, fmt.Errorf("FlatBuffers root offset 越界: offset=%d len=%d", rootOffset, len(body))
+		return nil, nil, nil, nil, fmt.Errorf("FlatBuffers root offset 越界: offset=%d len=%d", rootOffset, len(body))
 	}
 
 	// 解析 Parameters 列表（field index 5）
 	// 需要先解析 parameters，因为 FileEntry 通过 param_index 引用哈希类型
 	params, err = parseParameters(body, rootOffset)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("解析 Parameters 失败: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("解析 Parameters 失败: %w", err)
 	}
 
 	// 解析 Language 列表（field index 1）
 	// 建立 langMap: index(0-based) -> name，用于 language_mask 解码
 	langMap, err := parseLanguages(body, rootOffset)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("解析 Languages 失败: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("解析 Languages 失败: %w", err)
 	}
 
 	// 解析 Directory 列表（field index 3）
 	// 建立 dirMap: directory_id -> dirEntry，用于路径重建
 	dirMap, err := parseDirectories(body, rootOffset)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("解析 Directories 失败: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("解析 Directories 失败: %w", err)
 	}
 
 	// 解析 Bundle 列表（field index 0）
-	// 建立全局 Chunk 索引 chunkMap: chunk_id -> *ChunkInfo
+	// 建立全局 Chunk 索引 chunkMap: chunk_id -> *ChunkInfo，并记录每个 Bundle 的总压缩大小
 	// 关键：bundle_offset 在此阶段通过累加 compressed_size 推算
-	chunkMap, err := parseBundles(body, rootOffset)
+	chunkMap, bundleSizes, err := parseBundles(body, rootOffset)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("解析 Bundles 失败: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("解析 Bundles 失败: %w", err)
 	}
 
 	// 解析 FileEntry 列表（field index 2）
 	files, err = parseFileEntries(body, rootOffset, chunkMap, dirMap, langMap, params)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("解析 FileEntries 失败: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("解析 FileEntries 失败: %w", err)
 	}
 
 	// langMap 键为 bit index（= flag_id-1），按其升序还原声明顺序
@@ -200,7 +202,7 @@ func parseBody(body []byte) (files []FileEntry, flags []string, params []Params,
 		flags = append(flags, langMap[bit])
 	}
 
-	return files, flags, params, nil
+	return files, flags, params, bundleSizes, nil
 }
 
 // parseParameters 解析根对象的 parameters 字段（field index 5）。
@@ -267,7 +269,8 @@ func parseDirectories(body []byte, rootOffset uint32) (map[uint64]dirEntry, erro
 	return dirMap, nil
 }
 
-// parseBundles 解析 Bundle 列表（field index 0），建立全局 Chunk 索引。
+// parseBundles 解析 Bundle 列表（field index 0），建立全局 Chunk 索引，
+// 并记录每个 Bundle 的总压缩大小。
 //
 // 核心逻辑：
 // bundle_offset 不存储在 FlatBuffers 中，由 Parser 对同一 Bundle 内 Chunk 顺序
@@ -277,12 +280,16 @@ func parseDirectories(body []byte, rootOffset uint32) (map[uint64]dirEntry, erro
 //	for each chunk in bundle:
 //	    chunk.BundleOffset = offset
 //	    offset += chunk.CompressedSize
-func parseBundles(body []byte, rootOffset uint32) (map[uint64]*ChunkInfo, error) {
+//
+// 循环结束时 offset 的终值即该 Bundle 全部 Chunk 的 CompressedSize 之和，
+// 顺手记入返回的 sizes（bundleID -> 总大小）；chunkCount 为 0 的 Bundle 不入表。
+func parseBundles(body []byte, rootOffset uint32) (map[uint64]*ChunkInfo, map[uint64]uint32, error) {
 	dataStart, count := fbVectorInfo(body, rootOffset, 0)
 	// 预分配：粗略估计平均每 bundle 有 ~100 chunks
 	chunkMap := make(map[uint64]*ChunkInfo, int(count)*100)
+	sizes := make(map[uint64]uint32, count)
 	if count == 0 {
-		return chunkMap, nil
+		return chunkMap, sizes, nil
 	}
 
 	for i := uint32(0); i < count; i++ {
@@ -317,8 +324,10 @@ func parseBundles(body []byte, rootOffset uint32) (map[uint64]*ChunkInfo, error)
 			// 累加：下一个 chunk 的 offset = 当前 offset + 当前 compressed_size
 			bundleOffset += compSize
 		}
+		// 循环结束时 bundleOffset 的终值即该 bundle 全部 chunk 的总压缩大小
+		sizes[bundleID] = bundleOffset
 	}
-	return chunkMap, nil
+	return chunkMap, sizes, nil
 }
 
 // parseFileEntries 解析 FileEntry 列表（field index 2），

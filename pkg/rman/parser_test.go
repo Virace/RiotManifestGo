@@ -126,7 +126,7 @@ func TestBundleOffsetAccumulation(t *testing.T) {
 	// - 无 Language、Directory、FileEntry（避免关联复杂性）
 	body := buildMinimalFlatBuffersBody(t)
 
-	chunkMap, err := parseBundles(body, fbRootOffset(body))
+	chunkMap, sizes, err := parseBundles(body, fbRootOffset(body))
 	if err != nil {
 		t.Fatalf("parseBundles 失败: %v", err)
 	}
@@ -155,6 +155,62 @@ func TestBundleOffsetAccumulation(t *testing.T) {
 		if ci.CompressedSize != w.wantCompSize {
 			t.Errorf("chunk %X CompressedSize=%d, 期望 %d", w.id, ci.CompressedSize, w.wantCompSize)
 		}
+	}
+
+	// bundle 总大小 = 全部 chunk 的 CompressedSize 之和（100+150+200=450）
+	const wantBundleID = uint64(0x1234)
+	const wantTotalSize = uint32(100 + 150 + 200)
+	if len(sizes) != 1 {
+		t.Errorf("sizes 数量 = %d, 期望 1", len(sizes))
+	}
+	if got := sizes[wantBundleID]; got != wantTotalSize {
+		t.Errorf("sizes[%X] = %d, 期望 %d", wantBundleID, got, wantTotalSize)
+	}
+}
+
+// TestParseBundlesMultipleBundlesAndEmptyChunks 验证 parseBundles 对多个 Bundle
+// 各自独立累加总大小，且 chunkCount==0 的 Bundle 不在 sizes 中生成条目。
+func TestParseBundlesMultipleBundlesAndEmptyChunks(t *testing.T) {
+	specs := []bundleSpec{
+		{
+			bundleID: 0x1001,
+			chunks: []chunkSpec{
+				{chunkID: 0x1, compressedSize: 10, uncompressedSize: 20},
+				{chunkID: 0x2, compressedSize: 20, uncompressedSize: 40},
+			},
+		},
+		{
+			bundleID: 0x1002,
+			chunks: []chunkSpec{
+				{chunkID: 0x3, compressedSize: 5, uncompressedSize: 10},
+			},
+		},
+		{
+			bundleID: 0x1003,
+			chunks:   nil, // 空 chunks，不应产生 sizes 条目
+		},
+	}
+	body := buildFBBodyWithBundles(specs)
+
+	chunkMap, sizes, err := parseBundles(body, fbRootOffset(body))
+	if err != nil {
+		t.Fatalf("parseBundles 失败: %v", err)
+	}
+
+	if len(sizes) != 2 {
+		t.Fatalf("sizes 数量 = %d, 期望 2（空 chunks 的 bundle 不应入表）", len(sizes))
+	}
+	if got, want := sizes[0x1001], uint32(30); got != want {
+		t.Errorf("sizes[0x1001] = %d, 期望 %d", got, want)
+	}
+	if got, want := sizes[0x1002], uint32(5); got != want {
+		t.Errorf("sizes[0x1002] = %d, 期望 %d", got, want)
+	}
+	if _, ok := sizes[0x1003]; ok {
+		t.Error("sizes 不应包含空 chunks 的 bundle 0x1003")
+	}
+	if _, ok := chunkMap[0x3]; !ok {
+		t.Error("chunkMap 中找不到 bundle 0x1002 的 chunk 0x3")
 	}
 }
 
@@ -314,7 +370,7 @@ func TestParseBodyMalformedFlatBuffersReturnsError(t *testing.T) {
 		}
 	}()
 
-	if _, _, _, err := parseBody(body); err == nil {
+	if _, _, _, _, err := parseBody(body); err == nil {
 		t.Fatal("parseBody should reject malformed FlatBuffers body")
 	}
 }
@@ -481,6 +537,147 @@ func buildFBBodyUsingRawBytes() []byte {
 	// FlatBuffers 规范：buf[0:4] 存储根 Table 相对 buf[0] 的绝对偏移
 	patch32(rootOffPlaceholder, uint32(rootTablePos))
 
+	return buf
+}
+
+// chunkSpec 描述 buildFBBodyWithBundles 构造中一个 Chunk 的字段取值。
+type chunkSpec struct {
+	chunkID          uint64
+	compressedSize   uint32
+	uncompressedSize uint32
+}
+
+// bundleSpec 描述 buildFBBodyWithBundles 构造中一个 Bundle 及其 Chunk 列表。
+// chunks 为空切片时，构造出的 Bundle 对象不含 chunks 字段（field1 offset=0），
+// 对应 chunkCount==0 的场景。
+type bundleSpec struct {
+	bundleID uint64
+	chunks   []chunkSpec
+}
+
+// buildFBBodyWithBundles 构造仅含 Bundle 列表（无 Language/FileEntry/Parameters）的
+// 最小化 FlatBuffers body，用于测试 parseBundles 对多个 Bundle 的独立累加，
+// 以及空 chunks 的 Bundle 不产生 sizes 条目的行为。
+//
+// Table 布局与 buildFBBodyUsingRawBytes 一致，此处泛化为支持任意数量的 Bundle。
+func buildFBBodyWithBundles(specs []bundleSpec) []byte {
+	buf := make([]byte, 0, 512)
+
+	wr16 := func(v uint16) int {
+		pos := len(buf)
+		buf = append(buf, byte(v), byte(v>>8))
+		return pos
+	}
+	wr32 := func(v uint32) int {
+		pos := len(buf)
+		buf = append(buf, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+		return pos
+	}
+	wr64 := func(v uint64) int {
+		pos := len(buf)
+		buf = append(buf, byte(v), byte(v>>8), byte(v>>16), byte(v>>24),
+			byte(v>>32), byte(v>>40), byte(v>>48), byte(v>>56))
+		return pos
+	}
+	patch32 := func(pos int, v uint32) {
+		buf[pos] = byte(v)
+		buf[pos+1] = byte(v >> 8)
+		buf[pos+2] = byte(v >> 16)
+		buf[pos+3] = byte(v >> 24)
+	}
+
+	rootOffPlaceholder := wr32(0)
+
+	// Chunk Table：同 buildFBBodyUsingRawBytes 的布局
+	buildChunk := func(c chunkSpec) int {
+		vtablePos := len(buf)
+		wr16(10) // vtable_len
+		wr16(24) // obj_size
+		wr16(8)  // field0 chunk_id
+		wr16(16) // field1 compressed_size
+		wr16(20) // field2 uncompressed_size
+		tablePos := len(buf)
+		soffsetPos := wr32(0)
+		patch32(soffsetPos, uint32(int32(tablePos)-int32(vtablePos)))
+		wr32(0) // padding
+		wr64(c.chunkID)
+		wr32(c.compressedSize)
+		wr32(c.uncompressedSize)
+		return tablePos
+	}
+
+	writeTableVector := func(tablePositions []int) int {
+		pos := wr32(uint32(len(tablePositions)))
+		refPositions := make([]int, len(tablePositions))
+		for i := range tablePositions {
+			refPositions[i] = wr32(0)
+		}
+		for i, tp := range tablePositions {
+			patch32(refPositions[i], uint32(int32(tp)-int32(refPositions[i])))
+		}
+		return pos
+	}
+
+	bundleTablePositions := make([]int, 0, len(specs))
+	for _, spec := range specs {
+		hasChunks := len(spec.chunks) > 0
+		var chunkVecPos int
+		if hasChunks {
+			chunkPositions := make([]int, 0, len(spec.chunks))
+			for _, c := range spec.chunks {
+				chunkPositions = append(chunkPositions, buildChunk(c))
+			}
+			chunkVecPos = writeTableVector(chunkPositions)
+		}
+
+		// Bundle Table：field0=bundle_id, field1=chunks(vector)
+		// 无 chunks 时 field1 offset=0（字段不存在），对应 chunkCount==0
+		bundleVtablePos := len(buf)
+		wr16(8) // vtable_len
+		if hasChunks {
+			wr16(20) // obj_size
+		} else {
+			wr16(16) // obj_size（无 chunks_ref 字段）
+		}
+		wr16(8) // field0 bundle_id
+		if hasChunks {
+			wr16(16) // field1 chunks
+		} else {
+			wr16(0) // field1 不存在
+		}
+
+		bundleTablePos := len(buf)
+		bSoffset := wr32(0)
+		patch32(bSoffset, uint32(int32(bundleTablePos)-int32(bundleVtablePos)))
+		wr32(0) // padding
+		wr64(spec.bundleID)
+		if hasChunks {
+			chunkRefPos := wr32(0)
+			patch32(chunkRefPos, uint32(int32(chunkVecPos)-int32(chunkRefPos)))
+		}
+		bundleTablePositions = append(bundleTablePositions, bundleTablePos)
+	}
+
+	bundleVecPos := writeTableVector(bundleTablePositions)
+
+	// Root Table：field0=bundles，其余字段不存在
+	rootVtablePos := len(buf)
+	wr16(16) // vtable_len = 4 + 6*2
+	wr16(8)  // obj_size
+	wr16(4)  // field0 bundles
+	wr16(0)  // field1 languages 不存在
+	wr16(0)  // field2 fileEntries 不存在
+	wr16(0)  // field3 directories 不存在
+	wr16(0)  // field4 跳过
+	wr16(0)  // field5 parameters 不存在
+
+	rootTablePos := len(buf)
+	rSoffset := wr32(0)
+	patch32(rSoffset, uint32(int32(rootTablePos)-int32(rootVtablePos)))
+	bundleVecRefPos := wr32(0)
+	patch32(bundleVecRefPos, uint32(int32(bundleVecPos)-int32(bundleVecRefPos)))
+
+	patch32(rootOffPlaceholder, uint32(rootTablePos))
 	return buf
 }
 
@@ -752,5 +949,22 @@ func TestParseBytesPopulatesManifestMetadata(t *testing.T) {
 	}
 	if f.Chunks[0].HashType != HashTypeHKDF {
 		t.Errorf("Chunks[0].HashType = %s, 期望 HKDF（应由 param_index=0 关联）", f.Chunks[0].HashType)
+	}
+
+	// BundleSizes 应非空，且与 Files[].Chunks 反推一致：
+	// 对每个出现的 BundleID，其 size 应不小于该 bundle 任意 chunk 的 BundleOffset+CompressedSize。
+	if len(m.BundleSizes) == 0 {
+		t.Fatal("BundleSizes 为空，期望至少 1 条")
+	}
+	for _, chunk := range f.Chunks {
+		size, ok := m.BundleSizes[chunk.BundleID]
+		if !ok {
+			t.Errorf("BundleSizes 中找不到 BundleID=%X", chunk.BundleID)
+			continue
+		}
+		if got, want := size, chunk.BundleOffset+chunk.CompressedSize; got < want {
+			t.Errorf("BundleSizes[%X] = %d, 期望 >= %d（chunk %X 的 BundleOffset+CompressedSize）",
+				chunk.BundleID, got, want, chunk.ChunkID)
+		}
 	}
 }

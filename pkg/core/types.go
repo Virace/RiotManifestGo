@@ -38,4 +38,6 @@ type BundleJob struct {
 	BundleID       uint64
 	BundleFilename string
 	Ranges         []ChunkRange
+	FullBundle     bool   // true=整包作业：不发 Range 头的普通 GET，响应走 200 全体切片
+	BundleSize     uint32 // FullBundle 作业的整包字节数（动态超时与实际流量统计用）；非整包为 0
 }

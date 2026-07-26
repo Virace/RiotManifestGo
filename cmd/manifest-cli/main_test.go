@@ -447,6 +447,67 @@ func TestSummarizePlanEmptyJobs(t *testing.T) {
 	}
 }
 
+// ---- pickProbeBundle：-edge 探测目标选择 ----
+
+func TestPickProbeBundlePicksSmallestAtOrAboveOneMB(t *testing.T) {
+	sizes := map[uint64]uint32{
+		1: 500 * 1024,      // 500KB，< 1MB
+		2: 2 * 1024 * 1024, // 2MB
+		3: 1 * 1024 * 1024, // 恰好 1MB，>= 1MB 中最小
+	}
+	id, ok := pickProbeBundle(sizes)
+	if !ok {
+		t.Fatal("pickProbeBundle 期望 ok=true")
+	}
+	if id != 3 {
+		t.Errorf("id = %d, want 3（>=1MB 中最小者）", id)
+	}
+}
+
+func TestPickProbeBundleAllBelowOneMBPicksLargest(t *testing.T) {
+	sizes := map[uint64]uint32{
+		1: 100 * 1024,
+		2: 200 * 1024, // 全部 <1MB 时的最大者
+		3: 50 * 1024,
+	}
+	id, ok := pickProbeBundle(sizes)
+	if !ok {
+		t.Fatal("pickProbeBundle 期望 ok=true")
+	}
+	if id != 2 {
+		t.Errorf("id = %d, want 2（全部 <1MB 时取最大者）", id)
+	}
+}
+
+func TestPickProbeBundleTieBreaksBySmallerBundleID(t *testing.T) {
+	// >=1MB 分支同尺寸打平：BundleID 5 与 2 尺寸相同，须取较小的 2。
+	sizesGE := map[uint64]uint32{
+		5: 2 * 1024 * 1024,
+		2: 2 * 1024 * 1024,
+		9: 3 * 1024 * 1024,
+	}
+	if id, ok := pickProbeBundle(sizesGE); !ok || id != 2 {
+		t.Errorf(">=1MB 分支: id = %d, ok = %v, want 2, true", id, ok)
+	}
+
+	// 全 <1MB 分支同尺寸打平：BundleID 7 与 3 尺寸相同，须取较小的 3。
+	sizesLT := map[uint64]uint32{
+		7: 300 * 1024,
+		3: 300 * 1024,
+		4: 100 * 1024,
+	}
+	if id, ok := pickProbeBundle(sizesLT); !ok || id != 3 {
+		t.Errorf("<1MB 分支: id = %d, ok = %v, want 3, true", id, ok)
+	}
+}
+
+func TestPickProbeBundleEmptyReturnsFalse(t *testing.T) {
+	id, ok := pickProbeBundle(map[uint64]uint32{})
+	if ok {
+		t.Errorf("空表期望 ok=false，实际 id=%d, ok=%v", id, ok)
+	}
+}
+
 // ---- humanCount ----
 
 func TestHumanCount(t *testing.T) {

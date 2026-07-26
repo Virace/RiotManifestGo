@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"github.com/Virace/RiotManifestGo/pkg/core"
+	"github.com/Virace/RiotManifestGo/pkg/edge"
 	"github.com/Virace/RiotManifestGo/pkg/rman"
 	"github.com/Virace/RiotManifestGo/pkg/update"
 )
@@ -59,6 +61,8 @@ func main() {
 	maxRanges := flag.Int("max-ranges", 30, "单个 HTTP Range 请求的最大非连续段数（CDN 超过 30 段返回 400）")
 	fullBundleThreshold := flag.Float64("full-bundle-threshold", 0, "整包下载覆盖率阈值（0=禁用；启用建议 0.7：覆盖率达标的 Bundle 改为不带 Range 头的整包 GET，多下浪费字节换 multipart 兼容性）")
 	planOnly := flag.Bool("plan-only", false, "仅输出下载计划统计（作业数/整包数/段数/浪费字节/作业尺寸分位），零网络流量")
+	edgeFlag := flag.Bool("edge", false, "启用 CDN 边缘 IP 优选（多源 DNS 发现+探测打分，规避劣质节点；稳定性兜底，默认关闭）")
+	edgeWinners := flag.Int("edge-winners", 3, "边缘优选保留的节点数")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "RiotManifestGo CLI (%s, commit %s) — Riot 游戏资源清单解析与下载\n\n", version, commit)
@@ -192,6 +196,36 @@ func main() {
 		cancel()
 	}()
 
+	// 5. 边缘优选（-edge，默认关闭）：以 BundleSizes 中挑选的探测目标为基准，
+	// 对 cdnURLs 的每个域名做候选发现+探测打分，成功则用 selector.DialContext
+	// 接管后续 Bundle 请求的拨号；发现/探测全灭、初始化失败均回退系统 DNS，
+	// 不中断下载——dialContext 保持 nil 时 DownloadConfig 走 netpool 默认拨号。
+	var dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	if *edgeFlag {
+		if probeID, ok := pickProbeBundle(manifest.BundleSizes); ok {
+			probeURLs := make([]string, len(cdnURLs))
+			for i, u := range cdnURLs {
+				probeURLs[i] = u + "/" + core.BundleFilename(probeID)
+			}
+			var logf func(string, ...any)
+			if *verbose >= 2 && !*silent {
+				logf = func(f string, a ...any) { fmt.Printf("  [EDGE] "+f+"\n", a...) }
+			}
+			selector, err := edge.NewSelector(edge.Config{ProbeURLs: probeURLs, Winners: *edgeWinners, Logf: logf})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "⚠️  边缘优选初始化失败，回退系统 DNS: %v\n", err)
+			} else {
+				selector.Start(ctx)
+				if ws := selector.Winners(); len(ws) == 0 {
+					printer.info("⚠️  边缘优选未发现可用节点，回退系统 DNS\n")
+				} else {
+					printer.info("🌐 边缘优选启用: %d 个节点 %v\n", len(ws), ws)
+					dialContext = selector.DialContext
+				}
+			}
+		}
+	}
+
 	dlConfig := core.DownloadConfig{
 		CDNBaseURL:          *cdnURL,
 		CDNBaseURLs:         cdnURLs,
@@ -204,6 +238,7 @@ func main() {
 		RetryWait:           *retryWait,
 		FullBundleThreshold: *fullBundleThreshold,
 		BundleSizes:         manifest.BundleSizes,
+		DialContext:         dialContext,
 	}
 	dl := core.NewDownloader(dlConfig)
 
@@ -897,6 +932,44 @@ func printPlanSummary(printer *outputPrinter, s planSummary) {
 		humanSize(s.P50), humanSize(s.P90), humanSize(s.Max))
 }
 
+// ---- 边缘优选（-edge） ----
+
+// probeBundleMinSize 是 pickProbeBundle 挑选探测目标的尺寸门槛，与
+// edge.Config.ProbeBytes 的默认值（1MiB）一致：选够 1MiB 的 Bundle 才能让探测
+// 请求的 Range 落在真实数据区间内，避免探测体裁得比请求还短。
+const probeBundleMinSize = 1 << 20
+
+// pickProbeBundle 从 BundleSizes 选探测目标：>=1MB 的最小者，全部 <1MB 则取最大者；
+// 同尺寸按 BundleID 小者优先（map 遍历无序，保证确定性）；空表返回 false。
+func pickProbeBundle(sizes map[uint64]uint32) (uint64, bool) {
+	if len(sizes) == 0 {
+		return 0, false
+	}
+
+	var haveGE bool
+	var geID uint64
+	var geSize uint32
+	var haveMax bool
+	var maxID uint64
+	var maxSize uint32
+
+	for id, size := range sizes {
+		if !haveMax || size > maxSize || (size == maxSize && id < maxID) {
+			maxID, maxSize, haveMax = id, size, true
+		}
+		if size >= probeBundleMinSize {
+			if !haveGE || size < geSize || (size == geSize && id < geID) {
+				geID, geSize, haveGE = id, size, true
+			}
+		}
+	}
+
+	if haveGE {
+		return geID, true
+	}
+	return maxID, true
+}
+
 // ---- 工具函数 ----
 
 // parseCDNURLs 解析 -u 的逗号分隔多域名值：按逗号切分、去首尾空白、丢弃空项。
@@ -950,6 +1023,7 @@ func extractManifestArg(args []string) (manifest string, remaining []string) {
 		"-w": true, "-n": true, "-log": true, "-retry": true, "-v": true,
 		"-update": true, "-retry-wait": true,
 		"-gap-tolerance": true, "-max-ranges": true, "-full-bundle-threshold": true,
+		"-edge-winners": true,
 	}
 
 	remaining = make([]string, 0, len(args))

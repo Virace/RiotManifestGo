@@ -106,6 +106,8 @@ go build -o manifest-cli ./cmd/manifest-cli/
 | `-verify-only` | 仅校验本地文件完整性，不下载、不写盘 | `false` |
 | `-no-verify` | 跳过校验，将全部匹配文件当作全新内容整体下载 | `false` |
 | `-keep-removed` | 保留旧清单中已不存在的受管理文件（需 `-install`） | `false` |
+| `-edge` | 启用 CDN 边缘 IP 优选（多源发现 + 探测打分，规避劣质节点；稳定性兜底，非提速手段） | `false` |
+| `-edge-winners` | 边缘优选保留的节点数（仅 `-edge` 启用时生效） | `3` |
 
 `-repair`、`-verify-only`、`-no-verify` 两两互斥，同时指定多个会报错退出。
 `-update` 与 `-keep-removed` 是 install-only 参数；默认单独下载使用它们会报错。
@@ -121,6 +123,24 @@ manifest-cli old.manifest -o ./output -retry 5 -retry-wait 4s -w 8
 ```
 
 `-retry 5 -retry-wait 4s` 的等待序列为 4s/8s/16s/32s/60s，总计约 2 分钟，足以覆盖多数回源暖化；`-w` 降低并发可减少限流导致的连接强制断开（`connection forcibly closed`）。
+
+### 边缘优选（-edge）
+
+```bash
+manifest-cli game.manifest -o ./output -edge -edge-winners 3
+```
+
+**定位：稳定性兜底，不是提速手段。** riotcdn 的 CDN（CloudFront / Cloudflare / Akamai）走权威加权轮换，各优选 IP 单连接速度均匀，区分度体现在 TTFB 与可用性而非吞吐——实测中稀疏选择场景出现过单轮 27s 长尾（同配置其余轮 3-5s），`-edge` 的价值是避开 DNS 解析异常时段与劣质边缘节点，而不是让稳态下载更快。
+
+**发现源**（多源并行查询，任一源失败只影响自身、不影响其余源）：
+
+- 系统默认 DNS 解析
+- UDP 直查 `223.5.5.5`（阿里）、`119.29.29.29`（腾讯）、`1.1.1.1`（Cloudflare）
+- 阿里云 DoH（DNS over HTTPS）查询，携带 ECS（EDNS Client Subnet，出口 IP 的 /24 掩码）以获取更贴近调用方网络位置的解析结果
+
+**探测方式：** 对每个候选 IP 发起一次 1MB HTTP Range 探测请求，按 TTFB（首字节到达耗时）升序排序，取前 `-edge-winners` 个作为"赢家"；后续该清单涉及的 Bundle 下载连接按轮转方式分摊到这些赢家 IP 上。
+
+**兜底链：** 候选发现全部失败、或探测全部失败（赢家池为空）时自动回退系统 DNS，不中断下载；`-edge` 只接管清单所用 CDN 域名的连接，非该域名的请求不受影响。
 
 ### 多 Range 兼容处理
 

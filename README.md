@@ -51,6 +51,10 @@ go build -o manifest-cli ./cmd/manifest-cli/
 
 # 指定 CDN + 保存日志
 ./manifest-cli game.manifest -p "\.dll" -o ./output -u https://cdn.example.com/bundles -log download.log
+
+# 双域名分摊流量（-u 支持逗号分隔多个 CDN 域名；请求按哈希取模分摊到各域名，
+# 失败重试时自动轮转到下一个候选域名）
+./manifest-cli game.manifest -p "\.dll" -o ./output -u "https://lol.dyn.riotcdn.net/channels/public/bundles,https://lol.secure.dyn.riotcdn.net/channels/public/bundles"
 ```
 
 ### 受管理安装
@@ -106,6 +110,10 @@ go build -o manifest-cli ./cmd/manifest-cli/
 | `-verify-only` | 仅校验本地文件完整性，不下载、不写盘 | `false` |
 | `-no-verify` | 跳过校验，将全部匹配文件当作全新内容整体下载 | `false` |
 | `-keep-removed` | 保留旧清单中已不存在的受管理文件（需 `-install`） | `false` |
+| `-gap-tolerance` | Range 合并间隙容忍字节数（间隙小于该值的相邻 Chunk 合并为一段，多下少量字节换更少段数） | `32768`（32KB） |
+| `-max-ranges` | 单个 HTTP Range 请求的最大非连续段数（CDN 超过 30 段返回 400） | `30` |
+| `-full-bundle-threshold` | 整包下载覆盖率阈值（0=禁用；启用建议 `0.7`：覆盖率达标的 Bundle 改为不带 Range 头的整包 GET，多下浪费字节换 multipart 兼容性） | `0`（禁用） |
+| `-plan-only` | 仅输出下载计划统计（作业数/整包数/段数/浪费字节/作业尺寸分位），零网络流量 | `false` |
 | `-edge` | 启用 CDN 边缘 IP 优选（多源发现 + 探测打分，规避劣质节点；稳定性兜底，非提速手段） | `false` |
 | `-edge-winners` | 边缘优选保留的节点数（仅 `-edge` 启用时生效） | `3` |
 
@@ -113,6 +121,8 @@ go build -o manifest-cli ./cmd/manifest-cli/
 `-update` 与 `-keep-removed` 是 install-only 参数；默认单独下载使用它们会报错。
 
 如果输出目录已经存在 `.rman/installed.json`，默认单独下载、`-repair` 或 `-no-verify` 会拒绝写入，避免绕过安装状态造成混合版本；请改用 `-install` 或另选输出目录。只读的 `-verify-only` 仍然允许。
+
+`-gap-tolerance`/`-max-ranges`/`-full-bundle-threshold`/`-plan-only` 四个新 flag 默认值与引入前完全一致（**默认零行为变化**），只有显式传参才会改变下载计划；日常使用无需关心，仅在下方"下载计划预览与粒度调优"描述的特殊场景下才需要调整。
 
 ### 暂态 404 / CDN 冷对象
 
@@ -141,6 +151,39 @@ manifest-cli game.manifest -o ./output -edge -edge-winners 3
 **探测方式：** 对每个候选 IP 发起一次 1MB HTTP Range 探测请求，按 TTFB（首字节到达耗时）升序排序，取前 `-edge-winners` 个作为"赢家"；后续该清单涉及的 Bundle 下载连接按轮转方式分摊到这些赢家 IP 上。
 
 **兜底链：** 候选发现全部失败、或探测全部失败（赢家池为空）时自动回退系统 DNS，不中断下载；`-edge` 只接管清单所用 CDN 域名的连接，非该域名的请求不受影响。
+
+### 下载计划预览与粒度调优（-plan-only）
+
+`-plan-only` 复用真实下载同一条 Filter → Map → Schedule 链路计算下载计划，但不发起任何网络请求，可以在真正下载前零成本看清调参效果：
+
+```bash
+# 调整 -full-bundle-threshold 前先看计划变化，确认作业数/浪费字节符合预期再执行真实下载
+manifest-cli game.manifest -p "\.wad$" -plan-only -full-bundle-threshold 0.7
+```
+
+输出为作业数（含整包数）、Range 段数、有效字节、实际请求字节、合并/整包多下的浪费字节与占比、以及作业尺寸的 P50/P90/Max 分位。
+
+**默认参数即可跑满带宽，粒度参数用于特殊场景调优**（实测结论：PyManifest 16.14 KR 基准）：
+
+- `-full-bundle-threshold` 上调（如 `0.7`）不会减少请求数，批量场景反而多下约 3% 流量，价值在绕开部分 CDN 对 multipart Range 请求的行为差异、提升边缘缓存友好度，而不是提速；日常无需开启。
+- `-gap-tolerance` 上调适用于 Chunk 高度碎片化的增量更新（大量小间隙的相邻 Chunk 分布分散、合并阈值太小导致段数逼近甚至触及 `-max-ranges` 上限被迫拆分成多个请求）：调大后更多间隙被合并进同一段，用少量多下的字节换更少请求数。
+
+### 真实网络基准（scripts/bench-download.ps1）
+
+粒度参数调整后，用 `scripts/bench-download.ps1` 在真实网络下多轮运行并统计耗时，与 `-plan-only` 的零流量计划对照相互补充：
+
+```powershell
+# 多轮真实下载，统计各轮耗时与成功轮平均值
+pwsh scripts/bench-download.ps1 -Manifest .\game.manifest -Rounds 3
+
+# 透传任意 CLI 参数组合（如对比调大 gap-tolerance 前后的真实耗时）
+pwsh scripts/bench-download.ps1 -Manifest .\game.manifest -CliArgs @('-gap-tolerance','131072')
+
+# -PlanOnly：不下载，转为零流量的计划统计对照
+pwsh scripts/bench-download.ps1 -Manifest .\game.manifest -PlanOnly -CliArgs @('-full-bundle-threshold','0.7')
+```
+
+脚本默认 `-Exe .\manifest-cli.exe`，指向 `scripts/build.ps1` 的产物（`build/manifest-cli-windows-amd64.exe` 等）需显式传 `-Exe`；每轮开始前会清空 `-OutDir`（含 `.rman` 存档），保证每轮都是全新下载而非增量跳过。
 
 ### 多 Range 兼容处理
 

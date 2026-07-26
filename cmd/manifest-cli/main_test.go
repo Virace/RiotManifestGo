@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Virace/RiotManifestGo/pkg/core"
 	"github.com/Virace/RiotManifestGo/pkg/rman"
 	"github.com/Virace/RiotManifestGo/pkg/update"
 )
@@ -183,6 +184,34 @@ func TestExtractManifestArgConsumesUpdateFlagValue(t *testing.T) {
 	}
 }
 
+func TestExtractManifestArgConsumesGranularityFlagValues(t *testing.T) {
+	args := []string{
+		"game.manifest",
+		"-gap-tolerance", "65536",
+		"-max-ranges", "20",
+		"-full-bundle-threshold", "0.7",
+		"-plan-only",
+	}
+	manifest, remaining := extractManifestArg(args)
+	if manifest != "game.manifest" {
+		t.Errorf("manifest = %q, want game.manifest", manifest)
+	}
+	want := []string{
+		"-gap-tolerance", "65536",
+		"-max-ranges", "20",
+		"-full-bundle-threshold", "0.7",
+		"-plan-only",
+	}
+	if len(remaining) != len(want) {
+		t.Fatalf("remaining = %v, want %v", remaining, want)
+	}
+	for i := range want {
+		if remaining[i] != want[i] {
+			t.Errorf("remaining[%d] = %q, want %q", i, remaining[i], want[i])
+		}
+	}
+}
+
 func TestExtractManifestArgTreatsOperationAndModeFlagsAsBoolFlags(t *testing.T) {
 	args := []string{"-install", "-repair", "-verify-only", "-no-verify", "-keep-removed", "game.manifest"}
 	manifest, remaining := extractManifestArg(args)
@@ -308,6 +337,113 @@ func TestManifestInfoLinesNoParamsTable(t *testing.T) {
 
 	if !linesContain(lines, "哈希算法: 未声明") {
 		t.Errorf("无 Parameters 表时应显示未声明，实际输出:\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+// ---- parseCDNURLs：-u 逗号分隔多域名解析 ----
+
+func TestParseCDNURLs(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"single", "https://a.example.com", []string{"https://a.example.com"}},
+		{"two with spaces", "https://a.example.com, https://b.example.com",
+			[]string{"https://a.example.com", "https://b.example.com"}},
+		{"trailing comma", "https://a.example.com,https://b.example.com,",
+			[]string{"https://a.example.com", "https://b.example.com"}},
+		{"all empty", " , ,\t", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseCDNURLs(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("parseCDNURLs(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("parseCDNURLs(%q)[%d] = %q, want %q", tc.in, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// ---- summarizePlan：plan-only 计划统计 ----
+
+func TestSummarizePlan(t *testing.T) {
+	jobs := []core.BundleJob{
+		// Job0：整包作业。BundleSize=1000，内部 Chunk 有效字节合计 700 → 该作业多下 300。
+		{
+			BundleID:   1,
+			FullBundle: true,
+			BundleSize: 1000,
+			Ranges: []core.ChunkRange{
+				{Start: 0, End: 299, Chunks: []core.GlobalChunkTask{{CompressedSize: 300}}},
+				{Start: 300, End: 699, Chunks: []core.GlobalChunkTask{{CompressedSize: 400}}},
+			},
+		},
+		// Job1：两段 Range 作业，段宽与 Chunk 大小完全一致，无多下浪费。
+		{
+			BundleID: 2,
+			Ranges: []core.ChunkRange{
+				{Start: 0, End: 99, Chunks: []core.GlobalChunkTask{{CompressedSize: 100}}},
+				{Start: 150, End: 249, Chunks: []core.GlobalChunkTask{{CompressedSize: 100}}},
+			},
+		},
+		// Job2：单段 Range 作业，Gap Tolerance 合并产生 40 字节多下（段宽 190 vs Chunk 合计 150）。
+		{
+			BundleID: 3,
+			Ranges: []core.ChunkRange{
+				{Start: 0, End: 189, Chunks: []core.GlobalChunkTask{{CompressedSize: 100}, {CompressedSize: 50}}},
+			},
+		},
+	}
+
+	summary := summarizePlan(jobs)
+
+	if summary.Jobs != 3 {
+		t.Errorf("Jobs = %d, want 3", summary.Jobs)
+	}
+	if summary.FullBundleJobs != 1 {
+		t.Errorf("FullBundleJobs = %d, want 1", summary.FullBundleJobs)
+	}
+	// Segments 只统计非整包作业的 Range 段数：Job1 两段 + Job2 一段 = 3。
+	if summary.Segments != 3 {
+		t.Errorf("Segments = %d, want 3", summary.Segments)
+	}
+	// UsefulBytes = 全部 Chunk CompressedSize 之和：(300+400)+(100+100)+(100+50) = 1050。
+	if summary.UsefulBytes != 1050 {
+		t.Errorf("UsefulBytes = %d, want 1050", summary.UsefulBytes)
+	}
+	// FetchedBytes：整包用 BundleSize=1000；Job1 段宽 100+100=200；Job2 段宽 190 → 合计 1390。
+	if summary.FetchedBytes != 1390 {
+		t.Errorf("FetchedBytes = %d, want 1390", summary.FetchedBytes)
+	}
+	// 每作业 Fetched 字节 [1000, 200, 190] 升序为 [190, 200, 1000]：
+	// P50 idx=3*50/100=1 → 200；P90 idx=3*90/100=2 → 1000；Max=1000。
+	if summary.P50 != 200 {
+		t.Errorf("P50 = %d, want 200", summary.P50)
+	}
+	if summary.P90 != 1000 {
+		t.Errorf("P90 = %d, want 1000", summary.P90)
+	}
+	if summary.Max != 1000 {
+		t.Errorf("Max = %d, want 1000", summary.Max)
+	}
+}
+
+func TestSummarizePlanEmptyJobs(t *testing.T) {
+	summary := summarizePlan(nil)
+	if summary.Jobs != 0 || summary.FullBundleJobs != 0 || summary.Segments != 0 {
+		t.Errorf("summarizePlan(nil) 计数字段应全为 0，实际 %+v", summary)
+	}
+	if summary.UsefulBytes != 0 || summary.FetchedBytes != 0 {
+		t.Errorf("summarizePlan(nil) 字节字段应全为 0，实际 %+v", summary)
+	}
+	if summary.P50 != 0 || summary.P90 != 0 || summary.Max != 0 {
+		t.Errorf("summarizePlan(nil) 分位字段应全为 0，实际 %+v", summary)
 	}
 }
 

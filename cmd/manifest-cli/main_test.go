@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -90,10 +92,13 @@ func TestResolveUpdateModeRejectsMutuallyExclusiveCombinations(t *testing.T) {
 
 // ---- buildSyncOptions：flag → update.Options 映射 ----
 
-func TestBuildSyncOptionsDefaultRemovesDeleted(t *testing.T) {
-	opts := buildSyncOptions(update.ModeAuto, "", false)
-	if !opts.RemoveDeleted {
-		t.Error("keepRemoved=false 时 RemoveDeleted 期望 true（默认清理）")
+func TestBuildSyncOptionsDefaultsToStandaloneWithoutCleanup(t *testing.T) {
+	opts := buildSyncOptions(update.ModeAuto, false, "", false)
+	if opts.Operation != update.OperationDownload {
+		t.Errorf("Operation = %v, want OperationDownload", opts.Operation)
+	}
+	if opts.RemoveDeleted {
+		t.Error("默认 standalone 不得拥有清理权限")
 	}
 	if opts.OldManifestPath != "" {
 		t.Errorf("OldManifestPath = %q, want empty", opts.OldManifestPath)
@@ -103,20 +108,59 @@ func TestBuildSyncOptionsDefaultRemovesDeleted(t *testing.T) {
 	}
 }
 
-func TestBuildSyncOptionsKeepRemovedDisablesCleanup(t *testing.T) {
-	opts := buildSyncOptions(update.ModeAuto, "", true)
+func TestBuildSyncOptionsKeepRemovedDisablesManagedCleanup(t *testing.T) {
+	opts := buildSyncOptions(update.ModeAuto, true, "", true)
+	if opts.Operation != update.OperationInstall {
+		t.Errorf("Operation = %v, want OperationInstall", opts.Operation)
+	}
 	if opts.RemoveDeleted {
 		t.Error("keepRemoved=true 时 RemoveDeleted 期望 false（保留旧文件）")
 	}
 }
 
-func TestBuildSyncOptionsPassesThroughUpdatePath(t *testing.T) {
-	opts := buildSyncOptions(update.ModeRepair, "/tmp/old.manifest", false)
+func TestBuildSyncOptionsManagedInstallPassesUpdateAndEnablesCleanup(t *testing.T) {
+	opts := buildSyncOptions(update.ModeRepair, true, "/tmp/old.manifest", false)
 	if opts.OldManifestPath != "/tmp/old.manifest" {
 		t.Errorf("OldManifestPath = %q, want /tmp/old.manifest", opts.OldManifestPath)
 	}
 	if opts.Mode != update.ModeRepair {
 		t.Errorf("Mode = %v, want ModeRepair", opts.Mode)
+	}
+	if !opts.RemoveDeleted {
+		t.Error("受管理安装默认应启用清理")
+	}
+}
+
+func TestValidateInstallOnlyFlags(t *testing.T) {
+	if err := validateInstallOnlyFlags(false, "old.manifest", false); err == nil {
+		t.Error("standalone -update 应报错")
+	}
+	if err := validateInstallOnlyFlags(false, "", true); err == nil {
+		t.Error("standalone -keep-removed 应报错")
+	}
+	if err := validateInstallOnlyFlags(true, "old.manifest", true); err != nil {
+		t.Errorf("-install 应允许 install-only flags: %v", err)
+	}
+}
+
+func TestGuardStandaloneManagedRoot(t *testing.T) {
+	dir := t.TempDir()
+	rmanDir := filepath.Join(dir, ".rman")
+	if err := os.MkdirAll(rmanDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rmanDir, "installed.json"), []byte("{future-or-corrupt}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := guardStandaloneManagedRoot(dir, update.OperationDownload, update.ModeAuto); err == nil {
+		t.Error("standalone 写入受管理根应报错")
+	}
+	if err := guardStandaloneManagedRoot(dir, update.OperationDownload, update.ModeVerifyOnly); err != nil {
+		t.Errorf("standalone VERIFY_ONLY 应允许: %v", err)
+	}
+	if err := guardStandaloneManagedRoot(dir, update.OperationInstall, update.ModeAuto); err != nil {
+		t.Errorf("managed install 应允许: %v", err)
 	}
 }
 
@@ -139,13 +183,13 @@ func TestExtractManifestArgConsumesUpdateFlagValue(t *testing.T) {
 	}
 }
 
-func TestExtractManifestArgTreatsRepairVerifyOnlyNoVerifyAsBoolFlags(t *testing.T) {
-	args := []string{"-repair", "-verify-only", "-no-verify", "-keep-removed", "game.manifest"}
+func TestExtractManifestArgTreatsOperationAndModeFlagsAsBoolFlags(t *testing.T) {
+	args := []string{"-install", "-repair", "-verify-only", "-no-verify", "-keep-removed", "game.manifest"}
 	manifest, remaining := extractManifestArg(args)
 	if manifest != "game.manifest" {
 		t.Errorf("manifest = %q, want game.manifest", manifest)
 	}
-	want := []string{"-repair", "-verify-only", "-no-verify", "-keep-removed"}
+	want := []string{"-install", "-repair", "-verify-only", "-no-verify", "-keep-removed"}
 	if len(remaining) != len(want) {
 		t.Fatalf("remaining = %v, want %v", remaining, want)
 	}
@@ -194,9 +238,9 @@ func TestManifestInfoLinesShowsManifestFacts(t *testing.T) {
 		"ManifestID: 1122334455667788",
 		"RMAN v2.1",
 		"文件: 2",
-		"Chunk: 3",   // 唯一 ChunkID 去重后 3 个
-		"Bundle: 2",  // 0x1 与 0x2
-		"600 B",      // 压缩总量 100+300+200，共享 Chunk 只计一次
+		"Chunk: 3",  // 唯一 ChunkID 去重后 3 个
+		"Bundle: 2", // 0x1 与 0x2
+		"600 B",     // 压缩总量 100+300+200，共享 Chunk 只计一次
 		"哈希算法: HKDF",
 		"4.0 KB ~ 16.0 KB",
 		"en_US, zh_CN（共 2 个）",

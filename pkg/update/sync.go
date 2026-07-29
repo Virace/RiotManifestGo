@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/Virace/RiotManifestGo/internal/fswriter"
 	"github.com/Virace/RiotManifestGo/pkg/core"
@@ -17,20 +18,28 @@ import (
 // 一次性读入内存。
 const moveCopyBufSize = 1 << 20 // 1MB
 
-// Mode 决定 Sync 如何确定需要处理哪些文件、以及是否信任本地已有数据。
+// Operation 决定一次 Sync 是独立下载，还是维护带持久状态的受管理安装。
+type Operation int
+
+const (
+	// OperationDownload 是默认操作：只处理当前 targets，不读取或写入 .rman，
+	// 也没有移动复用和清理权限。
+	OperationDownload Operation = iota
+	// OperationInstall 显式启用受管理安装：读取 schema 2 覆盖、执行受授权的
+	// 增量动作，并在整批成功后推进 installed.json。
+	OperationInstall
+)
+
+// Mode 决定在选定 Operation 内如何校验和获取目标文件。
 type Mode int
 
 const (
-	// ModeAuto 默认模式：有旧清单时按 diff 做文件级跳过（Unchanged 直接跳过、不
-	// 验证），Changed/Added 按 chunk 级校验补洞；无旧清单时退化为全部按 Changed
-	// 处理（全量验证）。
+	// ModeAuto 默认策略：独立下载逐文件校验补洞；受管理安装仅对已记录覆盖且
+	// 通过普通文件/大小门禁的 Unchanged 文件做快速跳过。
 	ModeAuto Mode = iota
-	// ModeRepair 不做文件级跳过，逐文件按新清单重新验证补洞——用于修复被
-	// ModeAuto 跳过掩盖的本地损坏：AUTO 跳过的 Unchanged 文件从不验证，损坏
-	// 无法自愈，必须有显式档位强制全量验证。
+	// ModeRepair 不做文件级跳过，逐文件按新清单重新验证补洞。
 	ModeRepair
-	// ModeVerifyOnly 与 ModeRepair 一样逐文件验证，但零写盘、零下载、零存档，
-	// 仅用于诊断本地完整性（dry-run）。
+	// ModeVerifyOnly 与 ModeRepair 一样逐文件验证，但零写盘、零下载、零状态变更。
 	ModeVerifyOnly
 	// ModeForceFull 跳过验证，把全部文件当作全新内容整体下载（对应 CLI
 	// -no-verify）。
@@ -39,16 +48,13 @@ const (
 
 // Options 是 Sync 的行为参数。
 type Options struct {
-	Mode Mode
-	// OldManifestPath 显式指定旧清单路径；为空时从 Archive.InstalledManifestPath()
-	// 自动发现，仍找不到时视为无旧清单。ModeRepair/ModeVerifyOnly/ModeForceFull
-	// 不使用旧清单，此字段被忽略。
+	Operation Operation
+	Mode      Mode
+	// OldManifestPath 仅供 OperationInstall 使用。显式旧清单只是 diff 提示；
+	// 只有匹配的 schema 2 状态成员才能授权跳过、移动复用和清理。
 	OldManifestPath string
-	// RemoveDeleted 控制是否清理"旧内容不再需要保留"的路径；调用方需要
-	// "默认删除"语义时应显式传 true（CLI -keep-removed 置 false）。涵盖两类
-	// 路径：diff.Result.Removed 列表（旧清单有、新清单已不存在）；以及每个成功
-	// 提交的 Moved 配对的旧路径（新清单里已经以新路径存在，旧路径只是重命名前
-	// 的副本）。不做这两类之外的任何其他清理。
+	// RemoveDeleted 仅供 OperationInstall 使用，且只清理 schema 2 明确管理的
+	// Removed 路径与成功 Moved 的旧路径。
 	RemoveDeleted bool
 }
 
@@ -77,21 +83,30 @@ type pendingFile struct {
 	path        string // 清单相对路径（新路径）
 	fullPath    string
 	stagingPath string
-	movedFrom   string // 仅 moved=true 时有效：旧路径的磁盘绝对路径，提交成功后按 RemoveDeleted 清理
-	exists      bool   // patch 类：处理前磁盘上是否已存在同名文件（Created 与 Patched 的分类依据）
-	reusedBytes int64  // 本地复用（读旧文件写 staging）的字节数
+	exists      bool  // patch 类：处理前磁盘上是否已存在同名文件（Created 与 Patched 的分类依据）
+	reusedBytes int64 // 本地复用（读旧文件写 staging）的字节数
 }
 
-// Sync 是增量更新编排器：比较新旧清单、按 chunk 级复用本地数据、把缺失的 chunk
-// 灌入 Downloader 完成网络补洞，最后统一提交并（成功时）推进 installed.json。
+// syncPlan 保留本次目标动作，以及受信任旧覆盖到新状态的转换依据。
+type syncPlan struct {
+	result        diff.Result
+	fullDiff      diff.Result
+	previousState *InstalledState
+	hasDiff       bool
+	removedPaths  []string
+	movedOldPaths []string
+}
+
+// Sync 编排独立下载或受管理安装：按 chunk 级复用本地数据、下载缺失内容并逐文件
+// 原子提交。只有 OperationInstall 会读取/推进 installed.json 或执行清理。
 //
 // files 是本次调用实际要处理的文件子集（通常已经过 core.Filter，可能小于完整
-// 新清单）。newManifest.Files 是完整新清单条目：ModeAuto 下 resolveDiff 用它
+// 新清单）。newManifest.Files 是完整新清单条目：受管理 ModeAuto 用它
 // （而不是 files）与旧清单一起算完整 diff，再按 files 收窄到本次处理范围——
 // 这样旧清单里过滤范围外、但完整新清单仍然声明的路径，既不会被误判为
 // diff.Result.Removed（RemoveDeleted=true 时被误删），也不会被误配对成某个
-// 过滤内 Added 条目的 Moved 源（同样导致误删）。rawManifest/source 只用于成功
-// 后的 Archive.Save，存档的是完整新清单，与 files 的过滤范围无关。
+// 过滤内 Added 条目的 Moved 源（同样导致误删）。rawManifest/source 只用于
+// 受管理安装成功后的 Archive.Save，存档完整新清单，Files 记录实际确认的覆盖。
 func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, source string,
 	outputDir string, files []rman.FileEntry, d *core.Downloader, opts Options) (Stats, error) {
 
@@ -99,10 +114,11 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 		return Stats{}, err
 	}
 
-	diffResult, err := resolveDiff(outputDir, newManifest, files, opts)
+	plan, err := resolvePlan(outputDir, newManifest, files, opts)
 	if err != nil {
 		return Stats{}, err
 	}
+	diffResult := plan.result
 
 	if opts.Mode == ModeVerifyOnly {
 		return verifyOnlySync(ctx, diffResult.Changed, outputDir, d)
@@ -174,8 +190,8 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 		pending = append(pending, pf)
 	}
 
-	// Unchanged：只有 ModeAuto 找到旧清单时才可能非空，文件级快速跳过，不做任何验证
-	// （本地损坏的 Unchanged 文件在 AUTO 下不会被修复，需要 ModeRepair）。
+	// Unchanged 只包含受管理 ModeAuto 下同时通过 state membership、普通文件和
+	// 声明大小门禁的目标；门禁失败者已在 resolvePlan 中降级为 Changed。
 	for _, entry := range diffResult.Unchanged {
 		fullPath, err := core.OutputPath(outputDir, entry.Path)
 		if err != nil {
@@ -203,10 +219,7 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 	}
 
 	// 提交阶段：非 failed 文件 ClosePath+CommitStaging（含 Moved，发
-	// EventFileRenamed）；failed 文件 ClosePath+DiscardStaging。Moved 成功提交后
-	// 额外记下其旧路径，供本阶段末尾按 RemoveDeleted 决定是否清理源文件——旧路径
-	// 此时只是重命名前的内容重复副本，不应该跟随提交结果永久留在磁盘上。
-	var movedSources []string
+	// EventFileRenamed）；failed 文件 ClosePath+DiscardStaging。
 	for _, pf := range pending {
 		isFailed := failedSet[pf.path]
 		closeErr := pool.ClosePath(pf.stagingPath)
@@ -224,7 +237,6 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 
 		if pf.moved {
 			stats.Moved = append(stats.Moved, pf.path)
-			movedSources = append(movedSources, pf.movedFrom)
 			continue
 		}
 		stats.DownloadedBytes += downloadedByPath[pf.path]
@@ -235,20 +247,21 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 		}
 	}
 
-	// 清理阶段：RemoveDeleted → 删除 diff.Result.Removed 路径（发 EventFileRemoved）
-	// 与成功提交的 Moved 旧路径（不计入 Stats.Removed、不发额外事件——
-	// EventFileRenamed 已经表达了 From→To 的迁移语义，见 removeMovedSources 注释）。
-	if opts.RemoveDeleted {
-		removeMovedSources(movedSources)
-		if err := removeDeleted(outputDir, diffResult.Removed, d, &stats); err != nil {
-			return stats, err
+	// 清理与状态推进构成一次受管理状态转换：任何目标失败时两者都不执行，避免
+	// installed.json 仍指向旧状态、但它声明的旧文件已经被清掉。
+	if opts.Operation == OperationInstall && len(stats.Failed) == 0 {
+		if opts.RemoveDeleted {
+			if err := removeMovedSources(outputDir, plan.movedOldPaths); err != nil {
+				return stats, err
+			}
+			if err := removeDeleted(outputDir, plan.removedPaths, d, &stats); err != nil {
+				return stats, err
+			}
 		}
-	}
 
-	// 存档阶段：failed 为空 → Archive.Save(新清单)；否则不推进 installed.json。
-	if len(stats.Failed) == 0 {
+		managedFiles := nextManagedFiles(outputDir, plan, stats)
 		archive := NewArchive(outputDir)
-		if err := archive.Save(newManifest.ManifestID, rawManifest, source); err != nil {
+		if err := archive.Save(newManifest.ManifestID, rawManifest, source, managedFiles); err != nil {
 			return stats, fmt.Errorf("存档新清单失败: %w", err)
 		}
 	}
@@ -256,52 +269,107 @@ func Sync(ctx context.Context, newManifest *rman.Manifest, rawManifest []byte, s
 	return stats, nil
 }
 
-// resolveDiff 按 opts.Mode 决定 diff.Result：
-//   - ModeAuto：opts.OldManifestPath 优先，否则尝试 Archive 自动发现；找到则
-//     rman.ParseFile + diff.Diff(oldManifest.Files, newManifest.Files)——用完整
-//     新旧清单算 diff，而不是 files（本次调用实际要处理的子集，通常是 CLI
-//     -p/-f 过滤后的结果）。只用过滤子集做 diff 会让旧清单里过滤范围外、但完整
-//     新清单仍然声明的路径被误判为 Removed（RemoveDeleted=true 时被误删），也
-//     可能被误配对成某个过滤内 Added 条目的 Moved 源（同样导致误删）。算出完整
-//     diff 后再用 filterDiffResult 按 files 收窄到本次实际要处理的范围。显式
-//     指定的路径解析失败视为硬错误（用户明确要求了某个旧清单，不能默默忽略）；
-//     自动发现的路径解析失败退化为"无旧清单"（那只是内部存档缓存，不应让它的
-//     损坏拖垮整次 Sync）。完全没有旧清单时，把 files 全部视为 Changed
-//     （Unchanged 默认不验证，因此不带旧清单跑一次即等价于全量验证），
-//     Unchanged/Added/Moved/Removed 均为空。
-//   - ModeRepair/ModeVerifyOnly：不解析旧清单、不做 diff，files 全部视为 Changed
-//     （不做文件级跳过）。
-//   - ModeForceFull：不解析旧清单，files 全部视为 Added（对应"跳过验证、整体重下"）。
-func resolveDiff(outputDir string, newManifest *rman.Manifest, files []rman.FileEntry, opts Options) (diff.Result, error) {
-	switch opts.Mode {
-	case ModeRepair, ModeVerifyOnly:
-		return diff.Result{Changed: files}, nil
-	case ModeForceFull:
-		return diff.Result{Added: files}, nil
+// resolvePlan 将 Operation 与 Mode 两个维度组合成实际动作。独立下载从不读取
+// Archive；受管理安装可以用旧清单做完整 diff，但文件级快捷动作还必须由匹配的
+// schema 2 Files 成员授权。
+func resolvePlan(outputDir string, newManifest *rman.Manifest, files []rman.FileEntry, opts Options) (syncPlan, error) {
+	if opts.Operation != OperationInstall || opts.Mode == ModeVerifyOnly {
+		return syncPlan{result: nonDiffResult(files, opts.Mode)}, nil
 	}
 
-	oldPath := opts.OldManifestPath
-	explicit := oldPath != ""
-	if !explicit {
-		archive := NewArchive(outputDir)
-		if p, ok := archive.InstalledManifestPath(); ok {
-			oldPath = p
-		}
-	}
-	if oldPath == "" {
-		return diff.Result{Changed: files}, nil
-	}
-
-	oldManifest, err := rman.ParseFile(oldPath)
+	archive := NewArchive(outputDir)
+	state, err := archive.LoadInstalled()
 	if err != nil {
-		if explicit {
-			return diff.Result{}, fmt.Errorf("解析旧清单失败 %s: %w", oldPath, err)
-		}
-		return diff.Result{Changed: files}, nil
+		return syncPlan{}, err
+	}
+
+	oldManifest, err := selectOldManifest(archive, state, newManifest, opts.OldManifestPath)
+	if err != nil {
+		return syncPlan{}, err
+	}
+	if oldManifest == nil {
+		return syncPlan{result: nonDiffResult(files, opts.Mode)}, nil
 	}
 
 	full := diff.Diff(oldManifest.Files, newManifest.Files)
-	return filterDiffResult(full, files), nil
+	var trustedState *InstalledState
+	if state != nil && state.Schema == schemaVersion &&
+		state.ManifestID == fmt.Sprintf("%016X", oldManifest.ManifestID) {
+		trustedState = state
+	}
+	removedPaths, movedOldPaths := authorizedCleanupPaths(full, files, trustedState)
+
+	plan := syncPlan{
+		result:        nonDiffResult(files, opts.Mode),
+		fullDiff:      full,
+		previousState: trustedState,
+		hasDiff:       true,
+		removedPaths:  removedPaths,
+		movedOldPaths: movedOldPaths,
+	}
+	if opts.Mode == ModeAuto {
+		plan.result = authorizeAutoActions(outputDir, filterDiffResult(full, files), trustedState)
+	}
+	return plan, nil
+}
+
+// selectOldManifest 让 schema 2 managed state 优先于 stale 显式 hint。state 已指向
+// 当前新清单时可直接用 new；显式清单只有与 state ManifestID 匹配时才能替代
+// state archive。schema 1 没有覆盖权限，仍保持显式 hint 优先。
+func selectOldManifest(archive *Archive, state *InstalledState, newManifest *rman.Manifest,
+	explicitPath string) (*rman.Manifest, error) {
+	statePath, statePathOK := archive.InstalledManifestPath()
+	if state != nil && state.Schema == schemaVersion && statePathOK {
+		if state.ManifestID == fmt.Sprintf("%016X", newManifest.ManifestID) {
+			return newManifest, nil
+		}
+
+		var explicitManifest *rman.Manifest
+		var explicitErr error
+		if explicitPath != "" {
+			explicitManifest, explicitErr = rman.ParseFile(explicitPath)
+			if explicitErr == nil &&
+				state.ManifestID == fmt.Sprintf("%016X", explicitManifest.ManifestID) {
+				return explicitManifest, nil
+			}
+		}
+
+		stateManifest, stateErr := rman.ParseFile(statePath)
+		if stateErr == nil {
+			return stateManifest, nil
+		}
+		if explicitPath != "" {
+			if explicitErr != nil {
+				return nil, fmt.Errorf("解析旧清单失败 %s: %w", explicitPath, explicitErr)
+			}
+			return explicitManifest, nil
+		}
+		return nil, nil
+	}
+
+	oldPath := explicitPath
+	explicit := oldPath != ""
+	if !explicit && statePathOK {
+		oldPath = statePath
+	}
+	if oldPath == "" {
+		return nil, nil
+	}
+	oldManifest, err := rman.ParseFile(oldPath)
+	if err != nil {
+		if explicit {
+			return nil, fmt.Errorf("解析旧清单失败 %s: %w", oldPath, err)
+		}
+		return nil, nil
+	}
+	return oldManifest, nil
+}
+
+func nonDiffResult(files []rman.FileEntry, mode Mode) diff.Result {
+	if mode == ModeForceFull {
+		return diff.Result{Added: files}
+	}
+	return diff.Result{Changed: files}
 }
 
 // filterDiffResult 把基于完整新旧清单算出的 full 差分结果，按 files（本次调用
@@ -346,6 +414,126 @@ func filterDiffResult(full diff.Result, files []rman.FileEntry) diff.Result {
 		}
 	}
 	return filtered
+}
+
+// authorizeAutoActions 将纯 manifest diff 收紧到 schema 2 的真实所有权边界。
+// 未受管理或磁盘门禁失败的 Unchanged/Moved 目标都会退化为普通 PATCH。
+func authorizeAutoActions(outputDir string, result diff.Result, state *InstalledState) diff.Result {
+	managed := managedFileSet(state)
+	authorized := diff.Result{
+		Changed: append([]rman.FileEntry(nil), result.Changed...),
+		Added:   append([]rman.FileEntry(nil), result.Added...),
+	}
+
+	for _, entry := range result.Unchanged {
+		if _, ok := managed[managedPath(entry.Path)]; ok &&
+			regularFileMatches(outputDir, entry.Path, entry.FileSize) {
+			authorized.Unchanged = append(authorized.Unchanged, entry)
+		} else {
+			authorized.Changed = append(authorized.Changed, entry)
+		}
+	}
+	for _, pair := range result.Moved {
+		if _, ok := managed[managedPath(pair.From)]; ok &&
+			regularFileMatches(outputDir, pair.From, pair.Entry.FileSize) {
+			authorized.Moved = append(authorized.Moved, pair)
+		} else {
+			authorized.Changed = append(authorized.Changed, pair.Entry)
+		}
+	}
+	return authorized
+}
+
+// authorizedCleanupPaths 独立于校验策略计算清理范围。真实 Removed 对所有 install
+// 策略生效；Moved 旧源只有在对应新目标属于本轮选择时才纳入，确保 PATCH/REPAIR/
+// FORCE_FULL 成功后也不会遗留受管理旧路径。
+func authorizedCleanupPaths(full diff.Result, files []rman.FileEntry, state *InstalledState) ([]string, []string) {
+	managed := managedFileSet(state)
+	if len(managed) == 0 {
+		return nil, nil
+	}
+
+	targets := make(map[string]struct{}, len(files))
+	for _, entry := range files {
+		targets[managedPath(entry.Path)] = struct{}{}
+	}
+
+	removed := make([]string, 0, len(full.Removed))
+	for _, oldPath := range full.Removed {
+		if _, ok := managed[managedPath(oldPath)]; ok {
+			removed = append(removed, oldPath)
+		}
+	}
+
+	movedOld := make([]string, 0, len(full.Moved))
+	for _, pair := range full.Moved {
+		_, selected := targets[managedPath(pair.Entry.Path)]
+		_, owned := managed[managedPath(pair.From)]
+		if selected && owned {
+			movedOld = append(movedOld, pair.From)
+		}
+	}
+	return removed, movedOld
+}
+
+func managedFileSet(state *InstalledState) map[string]struct{} {
+	if state == nil || state.Schema != schemaVersion {
+		return nil
+	}
+	files := make(map[string]struct{}, len(state.Files))
+	for _, file := range state.Files {
+		files[managedPath(file)] = struct{}{}
+	}
+	return files
+}
+
+func managedPath(file string) string {
+	return strings.ReplaceAll(file, "\\", "/")
+}
+
+// regularFileMatches 是 AUTO 快速跳过、MOVE 源复用和跨版本覆盖携带共用的廉价
+// 磁盘门禁。Lstat 明确拒绝符号链接；任何 stat/path 错误都按不匹配处理。
+func regularFileMatches(outputDir, manifestPath string, size uint64) bool {
+	fullPath, err := core.OutputPath(outputDir, manifestPath)
+	if err != nil {
+		return false
+	}
+	info, err := os.Lstat(fullPath)
+	return err == nil && info.Mode().IsRegular() && uint64(info.Size()) == size
+}
+
+// nextManagedFiles 计算成功受管理安装后的 schema 2 覆盖。旧覆盖只携带在完整
+// O→N diff 中内容未变且仍通过磁盘门禁的路径；本轮所有成功结果随后加入。
+func nextManagedFiles(outputDir string, plan syncPlan, stats Stats) []string {
+	files := make(map[string]struct{})
+	if plan.hasDiff && plan.previousState != nil {
+		previous := managedFileSet(plan.previousState)
+		for _, entry := range plan.fullDiff.Unchanged {
+			normalized := managedPath(entry.Path)
+			if _, ok := previous[normalized]; ok &&
+				regularFileMatches(outputDir, entry.Path, entry.FileSize) {
+				files[normalized] = struct{}{}
+			}
+		}
+	}
+
+	for _, paths := range [][]string{
+		stats.Skipped,
+		stats.Patched,
+		stats.Created,
+		stats.Moved,
+	} {
+		for _, file := range paths {
+			files[managedPath(file)] = struct{}{}
+		}
+	}
+
+	result := make([]string, 0, len(files))
+	for file := range files {
+		result = append(result, file)
+	}
+	sort.Strings(result)
+	return result
 }
 
 // verifyOnlySync 实现 ModeVerifyOnly：对 entries 逐一 VerifyFileChunks，零写盘、
@@ -432,7 +620,6 @@ func processMoved(path, fullPath, srcPath string, fileSize uint64, pool *fswrite
 		path:        path,
 		fullPath:    fullPath,
 		stagingPath: stagingPath,
-		movedFrom:   srcPath,
 		reusedBytes: offset,
 	}, nil
 }
@@ -559,17 +746,23 @@ func buildMissTaskMap(missesByPath map[string][]ChunkRef) map[uint64][]core.Glob
 	return bundleMap
 }
 
-// removeDeleted 删除 diff 判定为 Removed 的旧路径（仅这一列表内的路径，不做任何
-// 其他清理）；文件已不存在视为删除成功（幂等）。单个文件的删除失败是尽力而为，
-// 不阻塞其余文件、也不计入 Stats.Removed。
+// removeDeleted 删除已由 schema 2 ownership 筛选过的 Removed 路径。文件不存在
+// 视为成功；其他删除错误会阻止状态推进，避免写出与磁盘清理结果不一致的新状态。
 func removeDeleted(outputDir string, removed []string, d *core.Downloader, stats *Stats) error {
 	for _, path := range removed {
 		fullPath, err := core.OutputPath(outputDir, path)
 		if err != nil {
 			return err
 		}
+		info, statErr := os.Lstat(fullPath)
+		if statErr != nil && !os.IsNotExist(statErr) {
+			return fmt.Errorf("检查受管理旧文件 %s 失败: %w", path, statErr)
+		}
+		if statErr == nil && !info.Mode().IsRegular() {
+			return fmt.Errorf("受管理旧路径不是普通文件: %s", path)
+		}
 		if rmErr := os.Remove(fullPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			continue
+			return fmt.Errorf("删除受管理旧文件 %s 失败: %w", path, rmErr)
 		}
 		stats.Removed = append(stats.Removed, path)
 		d.Emit(core.EventFileRemoved{Path: fullPath})
@@ -577,18 +770,27 @@ func removeDeleted(outputDir string, removed []string, d *core.Downloader, stats
 	return nil
 }
 
-// removeMovedSources 删除成功提交的 Moved 配对的旧路径（sources 为磁盘绝对路径，
-// 只包含提交阶段已经 CommitStaging 成功的配对——失败的配对从未被加入这份列表，
-// 天然满足"目标提交失败时不动源文件"的约束）。只删除常规文件，路径已不存在或
-// 不是常规文件（如目录、符号链接）时跳过，不视为错误；单个文件的删除失败是
-// 尽力而为，不阻塞其余路径，与 removeDeleted 的语义一致。这里不写 Stats.Removed、
-// 不发事件——旧路径不是 diff 判定的"删除"，只是 Moved 迁移后的重复副本。
-func removeMovedSources(sources []string) {
-	for _, src := range sources {
+// removeMovedSources 删除本轮已成功建立新目标的受管理 Moved 旧路径。路径已不存在
+// 视为成功；其他形态或删除错误会阻止状态推进。这里不写 Stats.Removed、不发事件。
+func removeMovedSources(outputDir string, sources []string) error {
+	for _, source := range sources {
+		src, err := core.OutputPath(outputDir, source)
+		if err != nil {
+			return err
+		}
 		info, err := os.Lstat(src)
-		if err != nil || !info.Mode().IsRegular() {
+		if os.IsNotExist(err) {
 			continue
 		}
-		_ = os.Remove(src)
+		if err != nil {
+			return fmt.Errorf("检查受管理移动源 %s 失败: %w", src, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("受管理移动源不是普通文件: %s", src)
+		}
+		if err := os.Remove(src); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("删除受管理移动源 %s 失败: %w", src, err)
+		}
 	}
+	return nil
 }

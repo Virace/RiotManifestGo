@@ -47,11 +47,12 @@ func main() {
 	silent := flag.Bool("s", false, "静默模式，仅输出错误")
 	verbose := flag.Int("v", 0, "详细输出等级（0=默认进度条, 1=基础滚屏, 2=详细, 3=调试）")
 	showVersion := flag.Bool("version", false, "显示程序版本信息并退出")
-	updatePath := flag.String("update", "", "旧清单路径，用于增量更新比对（缺省时自动从本地存档发现）")
+	install := flag.Bool("install", false, "受管理安装模式：维护 .rman 状态并启用受授权的增量部署与清理")
+	updatePath := flag.String("update", "", "旧清单路径，用于受管理安装的增量比对（仅可与 -install 一起使用）")
 	repair := flag.Bool("repair", false, "修复模式：逐文件重新校验并补齐本地缺失/损坏的内容，不做文件级跳过")
 	verifyOnly := flag.Bool("verify-only", false, "仅校验本地文件完整性，不下载、不写盘")
 	noVerify := flag.Bool("no-verify", false, "跳过校验，将全部匹配文件当作全新内容整体下载")
-	keepRemoved := flag.Bool("keep-removed", false, "保留旧清单中已不存在的文件，不清理磁盘（默认清理）")
+	keepRemoved := flag.Bool("keep-removed", false, "受管理安装时保留旧文件，不清理磁盘（仅可与 -install 一起使用）")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "RiotManifestGo CLI (%s, commit %s) — Riot 游戏资源清单解析与下载\n\n", version, commit)
@@ -61,8 +62,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  manifest-cli game.manifest -list\n")
 		fmt.Fprintf(os.Stderr, "  manifest-cli https://...releases/XXX.manifest -list -p Aatrox -f ja_JP|ko_KR\n")
 		fmt.Fprintf(os.Stderr, "  manifest-cli game.manifest -p \"\\.dll\" -o ./output -log download.log\n")
-		fmt.Fprintf(os.Stderr, "  manifest-cli new.manifest -o ./output                 # 增量更新（自动发现旧版本）\n")
-		fmt.Fprintf(os.Stderr, "  manifest-cli new.manifest -o ./output -update old.manifest\n")
+		fmt.Fprintf(os.Stderr, "  manifest-cli new.manifest -o ./game -install          # 受管理安装（自动发现旧版本）\n")
+		fmt.Fprintf(os.Stderr, "  manifest-cli new.manifest -o ./game -install -update old.manifest\n")
 		fmt.Fprintf(os.Stderr, "  manifest-cli game.manifest -o ./output -verify-only    # 仅校验本地完整性\n")
 		fmt.Fprintf(os.Stderr, "  manifest-cli game.manifest -o ./output -repair         # 修复本地损坏内容\n\n")
 		fmt.Fprintf(os.Stderr, "参数:\n")
@@ -81,6 +82,10 @@ func main() {
 	updateMode, modeErr := resolveUpdateMode(*repair, *verifyOnly, *noVerify)
 	if modeErr != nil {
 		fmt.Fprintf(os.Stderr, "❌ %v\n", modeErr)
+		os.Exit(1)
+	}
+	if err := validateInstallOnlyFlags(*install, *updatePath, *keepRemoved); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 		os.Exit(1)
 	}
 
@@ -123,15 +128,22 @@ func main() {
 		return
 	}
 
-	// 4. 更新计划预览。待下载的 Chunk 集合由 Sync 按新旧清单差异动态决定，可能
+	opts := buildSyncOptions(updateMode, *install, *updatePath, *keepRemoved)
+	if err := guardStandaloneManagedRoot(*outputDir, opts.Operation, updateMode); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		os.Exit(1)
+	}
+
+	// 4. 处理计划预览。待下载的 Chunk 集合由 Sync 按新旧清单差异动态决定，可能
 	// 远小于 files 全集，因此预览只给出清单声明的总大小，不代表实际下载量。
 	var totalDeclaredSize uint64
 	for _, f := range files {
 		totalDeclaredSize += f.FileSize
 	}
-	printer.info("📦 更新计划:\n")
+	printer.info("📦 处理计划:\n")
 	printer.info("   文件数: %d\n", len(files))
 	printer.info("   声明总大小: %s\n", humanSize(int64(totalDeclaredSize)))
+	printer.info("   操作: %s\n", operationDescription(opts.Operation))
 	printer.info("   模式: %s\n", modeDescription(updateMode))
 	printer.info("   CDN: %s\n", *cdnURL)
 	printer.info("   Worker 数: %d\n\n", *workers)
@@ -163,8 +175,10 @@ func main() {
 
 	if updateMode == update.ModeVerifyOnly {
 		printer.info("🔍 开始验证...\n")
+	} else if opts.Operation == update.OperationInstall {
+		printer.info("🚀 开始安装...\n")
 	} else {
-		printer.info("🚀 开始更新...\n")
+		printer.info("🚀 开始下载...\n")
 	}
 
 	// 心跳 ticker：每 2 秒刷新一次，即使没有新 Chunk 完成也显示 elapsed；
@@ -174,7 +188,6 @@ func main() {
 		go heartbeat(dlLog, stopHeartbeat)
 	}
 
-	opts := buildSyncOptions(updateMode, *updatePath, *keepRemoved)
 	stats, syncErr := update.Sync(ctx, manifest, manifestRaw, manifestSource, *outputDir, files, dl, opts)
 	close(stopHeartbeat)
 
@@ -183,18 +196,18 @@ func main() {
 	elapsed := time.Since(dlLog.startTime)
 	if syncErr != nil {
 		if ctx.Err() != nil {
-			printer.info("⏹️  更新已取消\n")
+			printer.info("⏹️  操作已取消\n")
 		} else {
-			fmt.Fprintf(os.Stderr, "❌ 更新失败: %v\n", syncErr)
+			fmt.Fprintf(os.Stderr, "❌ 操作失败: %v\n", syncErr)
 		}
 	} else {
-		printSyncSummary(printer, updateMode, stats, elapsed)
+		printSyncSummary(printer, opts.Operation, updateMode, stats, elapsed)
 	}
 
 	// 保存日志
 	if *logFile != "" {
 		dlLog.elapsed = elapsed
-		if writeErr := saveLog(*logFile, dlLog, stats, updateMode, files, *verbose); writeErr != nil {
+		if writeErr := saveLog(*logFile, dlLog, stats, opts.Operation, updateMode, files, *verbose); writeErr != nil {
 			fmt.Fprintf(os.Stderr, "⚠️  保存日志失败: %v\n", writeErr)
 		} else {
 			printer.info("📝 日志已保存: %s\n", *logFile)
@@ -544,14 +557,55 @@ func resolveUpdateMode(repair, verifyOnly, noVerify bool) (update.Mode, error) {
 	}
 }
 
-// buildSyncOptions 将 -update/-keep-removed 映射为 update.Options；keepRemoved
-// 语义上与 RemoveDeleted 相反（未指定 -keep-removed 时默认清理旧内容）。
-func buildSyncOptions(mode update.Mode, updatePath string, keepRemoved bool) update.Options {
+// validateInstallOnlyFlags 拒绝让具有受管理语义的参数在默认独立下载中悄悄失效。
+func validateInstallOnlyFlags(install bool, updatePath string, keepRemoved bool) error {
+	if install {
+		return nil
+	}
+	if updatePath != "" {
+		return fmt.Errorf("-update 仅可与 -install 一起使用")
+	}
+	if keepRemoved {
+		return fmt.Errorf("-keep-removed 仅可与 -install 一起使用")
+	}
+	return nil
+}
+
+// buildSyncOptions 将操作意图与策略参数映射为 update.Options。
+func buildSyncOptions(mode update.Mode, install bool, updatePath string, keepRemoved bool) update.Options {
+	operation := update.OperationDownload
+	if install {
+		operation = update.OperationInstall
+	}
 	return update.Options{
+		Operation:       operation,
 		Mode:            mode,
 		OldManifestPath: updatePath,
-		RemoveDeleted:   !keepRemoved,
+		RemoveDeleted:   install && !keepRemoved,
 	}
+}
+
+// guardStandaloneManagedRoot 防止默认下载/修复/强制写入一个已有 installed.json
+// 的受管理根。VERIFY_ONLY 是只读操作，始终允许。
+func guardStandaloneManagedRoot(outputDir string, operation update.Operation, mode update.Mode) error {
+	if operation == update.OperationInstall || mode == update.ModeVerifyOnly {
+		return nil
+	}
+	exists, err := update.NewArchive(outputDir).HasInstalledState()
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("输出目录已包含受管理安装状态；请使用 -install，或改用其他 -o 目录")
+	}
+	return nil
+}
+
+func operationDescription(operation update.Operation) string {
+	if operation == update.OperationInstall {
+		return "受管理安装"
+	}
+	return "单独下载"
 }
 
 // modeDescription 返回 update.Mode 面向终端用户的中文描述。
@@ -564,14 +618,14 @@ func modeDescription(mode update.Mode) string {
 	case update.ModeForceFull:
 		return "强制全量（跳过校验）"
 	default:
-		return "自动增量"
+		return "自动（校验补洞）"
 	}
 }
 
 // printSyncSummary 输出一次 Sync 的汇总结果。ModeVerifyOnly 下 Stats.Failed
 // 表示"校验发现待修复"而非下载失败，因此单列逐文件校验结果、用不同措辞呈现；
 // 其余模式按跳过/修复/新建/移动/删除/失败分类汇总文件数与复用/下载字节数。
-func printSyncSummary(printer *outputPrinter, mode update.Mode, stats update.Stats, elapsed time.Duration) {
+func printSyncSummary(printer *outputPrinter, operation update.Operation, mode update.Mode, stats update.Stats, elapsed time.Duration) {
 	if mode == update.ModeVerifyOnly {
 		printer.info("🔍 验证结果:\n")
 		for _, p := range stats.Skipped {
@@ -585,8 +639,8 @@ func printSyncSummary(printer *outputPrinter, mode update.Mode, stats update.Sta
 		return
 	}
 
-	printer.info("✅ 更新完成！耗时 %s\n", elapsed.Round(time.Millisecond))
-	printer.info("📊 更新统计:\n")
+	printer.info("✅ %s完成！耗时 %s\n", operationDescription(operation), elapsed.Round(time.Millisecond))
+	printer.info("📊 处理统计:\n")
 	printer.info("   跳过（内容未变）: %d\n", len(stats.Skipped))
 	printer.info("   修复/补丁: %d\n", len(stats.Patched))
 	printer.info("   新建: %d\n", len(stats.Created))
@@ -606,7 +660,7 @@ func printSyncSummary(printer *outputPrinter, mode update.Mode, stats update.Sta
 
 // ---- 日志保存 ----
 
-func saveLog(path string, dl *downloadLog, stats update.Stats, mode update.Mode, files []rman.FileEntry, verboseLevel int) error {
+func saveLog(path string, dl *downloadLog, stats update.Stats, operation update.Operation, mode update.Mode, files []rman.FileEntry, verboseLevel int) error {
 	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
 		os.MkdirAll(dir, 0755)
@@ -615,8 +669,9 @@ func saveLog(path string, dl *downloadLog, stats update.Stats, mode update.Mode,
 	var sb strings.Builder
 
 	sb.WriteString("═══════════════════════════════════════\n")
-	sb.WriteString("  RiotManifestGo 更新日志\n")
+	sb.WriteString("  RiotManifestGo 下载/安装日志\n")
 	sb.WriteString(fmt.Sprintf("  时间: %s\n", dl.startTime.Format("2006-01-02 15:04:05")))
+	sb.WriteString(fmt.Sprintf("  操作: %s\n", operationDescription(operation)))
 	sb.WriteString(fmt.Sprintf("  模式: %s\n", modeDescription(mode)))
 	sb.WriteString("═══════════════════════════════════════\n\n")
 
@@ -637,7 +692,7 @@ func saveLog(path string, dl *downloadLog, stats update.Stats, mode update.Mode,
 		failedLabel = "待修复"
 	}
 
-	sb.WriteString("\n## 更新统计\n\n")
+	sb.WriteString("\n## 处理统计\n\n")
 	sb.WriteString(fmt.Sprintf("  耗时: %s\n", dl.elapsed.Round(time.Millisecond)))
 	sb.WriteString(fmt.Sprintf("  本地复用: %s\n", humanSize(stats.ReusedBytes)))
 	sb.WriteString(fmt.Sprintf("  网络下载: %s\n", humanSize(stats.DownloadedBytes)))

@@ -121,7 +121,10 @@ func TestRiotCDNDefaultAssetsMultiRange(t *testing.T) {
 		}
 	}
 
-	bundleClient := netpool.NewBundleClient(rangeFallbackBundleURL, 1)
+	bundleClient := netpool.NewBundleClient(netpool.ClientConfig{
+		BaseURLs: []string{rangeFallbackBundleURL},
+		Workers:  1,
+	})
 	defer bundleClient.Close()
 
 	t.Logf(
@@ -133,7 +136,12 @@ func TestRiotCDNDefaultAssetsMultiRange(t *testing.T) {
 
 	fetchCtx, cancelFetch := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancelFetch()
-	rangeData, err := bundleClient.FetchRanges(fetchCtx, candidate.BundleFilename, ranges)
+	rangeData, err := bundleClient.FetchRanges(
+		fetchCtx,
+		candidate.BundleFilename,
+		ranges,
+		netpool.FetchOptions{},
+	)
 	if err != nil {
 		t.Fatalf(
 			"fetch %s (%d ranges, %d bytes): %v",

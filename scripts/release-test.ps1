@@ -5,7 +5,7 @@
 #   2. fixed Riot CDN multi-Range integration (live manifest + bundle data)
 #   3. go test -tags=fixtures ./pkg/rman (offline fixture parser tests)
 #   4. E2E against two pinned manifest versions from the fixture cache:
-#        full download (10.9) -> corrupt + repair -> incremental update (13.12),
+#        managed install (10.9) -> corrupt + repair -> managed update (13.12),
 #      each step finished with a chunk-level -verify-only pass (exit code based),
 #      plus a parse smoke on the latest resolved manifest.
 #
@@ -94,6 +94,9 @@ function Get-InstalledManifestID {
         throw "installed.json missing: $installedPath"
     }
     $state = Get-Content -LiteralPath $installedPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([int]$state.schema -ne 2 -or $null -eq $state.files) {
+        throw "installed.json must use schema 2 with files coverage"
+    }
     return [string]$state.manifest_id
 }
 
@@ -189,18 +192,18 @@ try {
     New-Item -ItemType Directory -Force -Path $outputPath | Out-Null
     $logDir = Join-Path $repoRoot ".temp/release-test"
 
-    # Step 1: full download of the old version into an empty directory.
-    Write-Host "-- E2E step 1: full download $($oldFixture.version)"
-    Assert-CLISucceeded @($oldManifest, "-p", $targetPattern, "-o", $outputPath, "-w", "4", "-retry", "2", "-s") "full download"
+    # Step 1: managed installation of the old version into an empty directory.
+    Write-Host "-- E2E step 1: managed install $($oldFixture.version)"
+    Assert-CLISucceeded @($oldManifest, "-p", $targetPattern, "-o", $outputPath, "-install", "-w", "4", "-retry", "2", "-s") "managed install"
     foreach ($rel in $targetFiles) {
         $filePath = Join-Path $outputPath ($rel -replace "/", [IO.Path]::DirectorySeparatorChar)
         if (-not (Test-Path -LiteralPath $filePath)) {
-            throw "Expected file missing after full download: $rel"
+            throw "Expected file missing after managed install: $rel"
         }
     }
-    Assert-InstalledManifestID $oldFixture.manifest_id "full download"
+    Assert-InstalledManifestID $oldFixture.manifest_id "managed install"
     Assert-CLISucceeded @($oldManifest, "-p", $targetPattern, "-o", $outputPath, "-verify-only", "-s") "post-download verify"
-    Write-Host "full download OK, installed=$($oldFixture.manifest_id)"
+    Write-Host "managed install OK, installed=$($oldFixture.manifest_id)"
 
     # Step 2: corrupt one file in the middle, expect verify to flag it and
     # repair to re-download only the broken chunks.
@@ -224,7 +227,7 @@ try {
     }
 
     $repairLog = Join-Path $logDir "repair.log"
-    Assert-CLISucceeded @($oldManifest, "-p", $targetPattern, "-o", $outputPath, "-repair", "-log", $repairLog, "-w", "4", "-retry", "2", "-s") "repair"
+    Assert-CLISucceeded @($oldManifest, "-p", $targetPattern, "-o", $outputPath, "-install", "-repair", "-log", $repairLog, "-w", "4", "-retry", "2", "-s") "repair"
     $repairedBytes = Get-LogBytes $repairLog '网络下载'
     if ($repairedBytes -le 0 -or $repairedBytes -ge $corruptSize) {
         throw "repair should download only the broken chunks: downloaded=$repairedBytes, file size=$corruptSize"
@@ -240,7 +243,7 @@ try {
     # auto-discovered from the installed.json archive written in step 1.
     Write-Host "-- E2E step 3: incremental update to $($newFixture.version)"
     $updateLog = Join-Path $logDir "update.log"
-    Assert-CLISucceeded @($newManifest, "-p", $targetPattern, "-o", $outputPath, "-log", $updateLog, "-w", "4", "-retry", "2", "-s") "incremental update"
+    Assert-CLISucceeded @($newManifest, "-p", $targetPattern, "-o", $outputPath, "-install", "-log", $updateLog, "-w", "4", "-retry", "2", "-s") "incremental update"
     $updateDownloaded = Get-LogBytes $updateLog '网络下载'
     if ($updateDownloaded -le 0) {
         throw "cross-version update should download new content, downloaded=$updateDownloaded"
@@ -262,7 +265,7 @@ try {
 
     Write-Host "== [5/5] release test passed" -ForegroundColor Green
     Write-Host "  go tests:  $(if ($SkipGoTests) { 'skipped' } else { 'passed' })"
-    Write-Host "  E2E:       $($oldFixture.version) full -> repair -> $($newFixture.version) update -> verify"
+    Write-Host "  E2E:       $($oldFixture.version) install -> repair -> $($newFixture.version) update -> verify"
     Write-Host "  latest:    $($latestFixture.version) parse smoke"
 } finally {
     Pop-Location

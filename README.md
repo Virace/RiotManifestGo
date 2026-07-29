@@ -14,7 +14,8 @@ Riot 游戏资源清单（RMAN / `.manifest`）解析与下载工具的 Go 实�
 - **高速并发下载**：多 Worker 并行，HTTP Range 合并，ZSTD 流式解压
 - **CDN Range 兼容**：兼容 CloudFront 非标准 multipart boundary；只返回部分 `206` 时自动顺序补齐缺失段
 - **哈希校验**：支持 SHA256、SHA512、HKDF、Blake3 四种校验算法
-- **增量更新**：自动发现本地存档，按 chunk 级校验只下载新旧清单间真正变化的部分，未变化文件整个跳过、未变化数据本地复用
+- **下载与安装分离**：默认单独下载不维护状态；显式 `-install` 维护精确文件覆盖并执行安全增量部署
+- **受管理增量**：快速跳过/移动要求状态成员通过普通文件与大小门禁；清理也只触及状态明确记录的路径
 - **原子写盘**：下载与本地修复统一先写临时文件、完成后原子替换，中断不会损坏已有文件
 - **纯 Go 实现**：无 CGO 依赖，交叉编译友好
 
@@ -42,6 +43,8 @@ go build -o manifest-cli ./cmd/manifest-cli/
 
 ### 下载文件
 
+默认是无状态的单独下载：每次命令只处理本次匹配的文件，不读取或写入 `.rman/`，也不清理其他文件。使用同一输出目录分多次下载不同文件时，各次命令相互独立。
+
 ```bash
 # 下载匹配的 DLL 文件（使用默认 CDN）
 ./manifest-cli game.manifest -p "\.dll" -o ./output
@@ -50,28 +53,34 @@ go build -o manifest-cli ./cmd/manifest-cli/
 ./manifest-cli game.manifest -p "\.dll" -o ./output -u https://cdn.example.com/bundles -log download.log
 ```
 
-### 增量更新
+### 受管理安装
 
-`-o` 指向的输出目录下若已有上一次成功更新留下的本地存档（`.rman/` 目录，见下文），再次运行会自动按增量模式工作，无需任何额外参数；也可以显式指定旧清单路径。
+需要把输出目录当作一套可持续更新的部署时，显式使用 `-install`。程序只在受管理安装整批成功后维护 `.rman/installed.json`，并记录实际确认落盘的文件；多次带不同筛选条件执行会累积这些覆盖。
 
 ```bash
-# 增量更新：自动从本地存档发现旧版本，只下载真正变化的内容
-./manifest-cli new.manifest -o ./output
+# 首次受管理安装；筛选后的实际文件会记录到状态
+./manifest-cli game.manifest -p "description\.json" -o ./game -install
 
-# 显式指定旧清单（忽略本地存档）
-./manifest-cli new.manifest -o ./output -update old.manifest
+# 同一清单继续安装其他文件，覆盖会累积
+./manifest-cli game.manifest -p "\.wad\.client$" -o ./game -install
+
+# 新版本增量安装：自动发现旧版本
+./manifest-cli new.manifest -o ./game -install
+
+# 显式提供旧清单作为 diff 提示（不能替代 installed.json 的所有权记录）
+./manifest-cli new.manifest -o ./game -install -update old.manifest
 
 # 只校验本地文件完整性，不下载、不写盘；退出码非零表示存在待修复文件
-./manifest-cli game.manifest -o ./output -verify-only
+./manifest-cli game.manifest -o ./game -verify-only
 
-# 修复模式：逐文件重新校验，补齐本地缺失/损坏的内容（不做文件级跳过）
-./manifest-cli game.manifest -o ./output -repair
+# 修复受管理安装：逐文件重新校验，补齐本地缺失/损坏的内容
+./manifest-cli game.manifest -o ./game -install -repair
 
 # 强制全量：跳过一切校验，把匹配文件当作全新内容整体下载
-./manifest-cli game.manifest -o ./output -no-verify
+./manifest-cli game.manifest -o ./game -install -no-verify
 
-# 保留旧清单中已不存在的文件，以及重命名文件遗留的旧路径副本，不做默认的清理
-./manifest-cli new.manifest -o ./output -keep-removed
+# 保留旧清单中已不存在的受管理文件，不做默认清理
+./manifest-cli new.manifest -o ./game -install -keep-removed
 ```
 
 ## 参数
@@ -91,13 +100,17 @@ go build -o manifest-cli ./cmd/manifest-cli/
 | `-log` | 保存下载日志 | - |
 | `-retry` | Bundle 下载失败最大重试次数 | `3` |
 | `-retry-wait` | 重试指数退避基础等待，第 N 次重试前等待 base×2^(N-1)，单次封顶 60s 与 base 中较大者 | `1s` |
-| `-update` | 旧清单路径，用于增量更新比对（缺省时自动从本地存档发现） | - |
+| `-install` | 启用受管理安装，维护 `.rman` 状态与受授权的增量部署/清理 | `false` |
+| `-update` | 旧清单路径，仅作为受管理安装的 diff 提示（需 `-install`） | - |
 | `-repair` | 修复模式：逐文件重新校验并补齐本地缺失/损坏的内容，不做文件级跳过 | `false` |
 | `-verify-only` | 仅校验本地文件完整性，不下载、不写盘 | `false` |
 | `-no-verify` | 跳过校验，将全部匹配文件当作全新内容整体下载 | `false` |
-| `-keep-removed` | 保留旧清单中已不存在的文件，以及重命名文件的旧路径副本，不清理磁盘（默认清理） | `false` |
+| `-keep-removed` | 保留旧清单中已不存在的受管理文件（需 `-install`） | `false` |
 
 `-repair`、`-verify-only`、`-no-verify` 两两互斥，同时指定多个会报错退出。
+`-update` 与 `-keep-removed` 是 install-only 参数；默认单独下载使用它们会报错。
+
+如果输出目录已经存在 `.rman/installed.json`，默认单独下载、`-repair` 或 `-no-verify` 会拒绝写入，避免绕过安装状态造成混合版本；请改用 `-install` 或另选输出目录。只读的 `-verify-only` 仍然允许。
 
 ### 暂态 404 / CDN 冷对象
 
@@ -120,28 +133,27 @@ Worker 内顺序请求缺失段；后续 Bundle 直接使用单 Range 请求，�
 每段响应仍需通过范围、长度、ZSTD 解压及 Chunk 哈希校验，不会把一段内容错误
 映射到多个请求范围。
 
-## 更新模式
+## 操作与校验策略
 
-无论是否携带旧清单，下载、修复、更新走的都是同一条管线，没有单独的"更新"子命令：
+操作意图与校验策略是两个独立维度：
 
-| 本地状态 | 行为 |
-|---|---|
-| 目标文件在本地不存在 | 全量下载 |
-| 目标文件在本地已存在 | 按新清单的 chunk 布局逐块校验，仅补齐缺失或损坏的部分 |
-| 存在旧清单（`-update` 显式指定，或从 `.rman/installed.json` 自动发现） | 额外做一层文件级跳过：路径与 chunk 序列都未变化的文件整个跳过，不做任何 IO |
-
-四种模式（互不重叠的 CLI flag，行为差异如下）：
-
-| 模式 | 文件级跳过 | 本地内容校验 | 下载/写盘 | 适用场景 |
+| 操作 | 状态读写 | manifest diff | 移动/清理权限 | 默认用途 |
 |---|---|---|---|---|
-| 默认（不加 flag） | 有旧清单时启用 | 仅对未被跳过的文件做 chunk 级校验补洞 | 只有变化的内容才下载写盘 | 日常增量更新 |
-| `-repair` | 关闭 | 全部匹配文件逐一做 chunk 级校验补洞 | 仅缺失/损坏的部分下载写盘 | 怀疑本地文件损坏，包括被默认模式跳过的未变化文件 |
-| `-verify-only` | 关闭 | 全部匹配文件逐一做 chunk 级校验 | 不下载、不写盘（dry-run） | 只检查本地完整性；退出码非零表示存在待修复文件 |
-| `-no-verify` | 关闭 | 不校验 | 全部匹配文件当作全新内容整体下载 | 强制全量重新下载，跳过校验开销 |
+| 默认单独下载 | 不读不写 `.rman` | 不使用 | 无 | 独立获取一个或一组文件 |
+| `-install` 受管理安装 | 整批成功后写 schema 2 | 自动发现或 `-update` | 仅限状态已记录文件 | 部署并持续更新一个目录 |
+
+| 校验策略 | 文件级快速跳过 | 本地内容校验 | 下载/写盘 |
+|---|---|---|---|
+| 默认 AUTO | 仅受管理安装中，对状态成员且普通文件/大小匹配的 unchanged 目标启用 | 其余目标逐 chunk 校验补洞 | 只下载缺失/损坏内容 |
+| `-repair` | 关闭 | 全部匹配文件逐 chunk 校验补洞 | 只下载缺失/损坏内容 |
+| `-verify-only` | 关闭 | 全部匹配文件逐 chunk 校验 | 不下载、不写盘、不改状态 |
+| `-no-verify` | 关闭 | 不校验 | 全部匹配文件整体下载 |
+
+受管理 AUTO 中，manifest 判定“内容未变”还不够：路径必须位于 `installed.json.files`，磁盘目标必须是普通文件且大小符合清单，才能快速跳过。文件缺失、类型异常、大小不同或未在状态中记录时，都会降级为逐 chunk 校验/下载。
 
 ## 本地状态目录（.rman/）
 
-每次更新成功后，程序会在输出目录下维护一个 `.rman/` 状态目录，作为下一次增量更新的比对基准：
+只有 `-install` 受管理安装会维护 `.rman/`。`installed.json` 同时记录清单指针和当前清单下实际确认的受管理文件覆盖：
 
 ```
 <output>/.rman/
@@ -154,19 +166,27 @@ Worker 内顺序请求缺失段；后续 Bundle 直接使用单 Range 请求，�
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "manifest_id": "037EC59D5BD7C5D3",
   "manifest_file": "manifests/037EC59D5BD7C5D3.manifest",
   "source": "https://lol.secure.dyn.riotcdn.net/channels/public/releases/037EC59D5BD7C5D3.manifest",
-  "updated_at": "2026-07-18T12:00:00Z"
+  "updated_at": "2026-07-29T12:00:00Z",
+  "files": [
+    "Config/description.json",
+    "DATA/FINAL/Maps/Shipping.wad.client"
+  ]
 }
 ```
 
-该文件格式（含字段名、`manifests/` 相对路径中的正斜杠、`updated_at` 的 UTC RFC3339 时间格式）与姊妹 Python 项目共享，属于跨语言数据契约，不应手工修改；`schema` 用于标识格式版本，无法识别的 `schema` 会被当作没有可用状态处理，退化为全量验证——逐文件按 chunk 级重新校验，本地已完好的数据仍会被复用，只补齐缺失或损坏的部分，并不等同于 `-no-verify` 那种整体重新下载。只有整批更新全部成功时才会推进这份状态；中途失败不会写入半新不旧的版本记录。
+`files` 是受管理所有权边界，不是“本轮发生过网络下载”的历史：被当前运行确认完整或成功提交的目标都会记录；同一清单的多次部分安装会累积覆盖。跨版本时，只携带内容未变、仍由新清单声明且通过普通文件/大小检查的旧覆盖；变化但本轮未选择的文件不会冒充已安装。
+
+该格式与姊妹 Python 项目共享，路径统一使用 `/`、排序并去重，`updated_at` 使用 UTC RFC3339；schema 2 必须显式包含数组类型的 `files`（空覆盖写作 `[]`，字段缺失或 `null` 均无效）。legacy schema 1 仍可提供旧 manifest 指针作为 diff 提示，但没有可信文件覆盖，不能授权 SKIP、MOVE 或 REMOVE；下一次成功受管理安装会写成 schema 2。未知 schema 按无状态处理。
+
+只有本轮全部目标和受管理清理均成功时才会推进状态；中途失败会保留上一份 `installed.json`。`-keep-removed` 会保留磁盘旧文件，但这些已不属于新清单的路径仍会从新状态覆盖中移除。
 
 ### 临时文件与磁盘占用
 
-每个目标文件在写入前都会先落地为同目录下的 `<文件名>.rman-tmp` 临时文件，待该文件全部内容就绪后再原子替换正式文件；替换完成前，旧文件始终保持完整、可读。但本次更新涉及的所有文件（新增、内容变化、重命名）都会先各自落地 staging，再统一发起一次批量下载、最后统一提交，因此一次更新过程中额外占用的磁盘空间峰值，约等于**本次更新涉及的全部文件的新内容大小之和**，而不是其中单个最大文件的大小。如果磁盘空间紧张，可以用 `-p` / `-f` 过滤把一次大更新拆成多批执行，降低单批峰值占用。注意：任意一批全部成功后，本地版本状态（`installed.json`）就会指向完整的新清单，后续批次会被差异比对判为"无变化"而跳过——因此从第二批起应改用 `-repair`（逐文件校验补洞，不做文件级跳过）完成剩余内容，最后可不带过滤执行一次 `-verify-only` 复核完整性。
+每个目标文件在写入前都会先落地为同目录下的 `<文件名>.rman-tmp` 临时文件，待该文件全部内容就绪后再原子替换正式文件；替换完成前，旧文件始终保持完整、可读。但本次操作涉及的所有文件会先各自落地 staging，再统一发起一次批量下载、最后统一提交，因此额外磁盘空间峰值约等于**本次操作涉及的全部文件的新内容大小之和**。磁盘空间紧张时可用 `-p` / `-f` 把受管理安装拆成多批；schema 2 会记录并累积每批实际确认的文件，不再要求后续批次改用 `-repair`。
 
 ## 架构
 

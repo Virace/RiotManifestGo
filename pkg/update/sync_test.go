@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"testing"
@@ -256,6 +257,30 @@ func writeOldManifestFile(t *testing.T, dir string, manifestID uint64, specs []o
 		t.Fatalf("写入旧清单文件失败: %v", err)
 	}
 	return path
+}
+
+// managedAutoOptions 建立一份与旧清单匹配的 schema 2 覆盖，并返回受管理 AUTO
+// 选项。只有调用此辅助的测试才拥有 SKIP/MOVE/REMOVE 权限。
+func managedAutoOptions(t *testing.T, dir, oldManifestPath string, manifestID uint64,
+	specs []oldFileSpec, removeDeleted bool) Options {
+	t.Helper()
+	raw, err := os.ReadFile(oldManifestPath)
+	if err != nil {
+		t.Fatalf("读取旧清单失败: %v", err)
+	}
+	files := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		files = append(files, spec.path)
+	}
+	if err := NewArchive(dir).Save(manifestID, raw, "test://old-manifest", files); err != nil {
+		t.Fatalf("建立旧安装状态失败: %v", err)
+	}
+	return Options{
+		Operation:       OperationInstall,
+		Mode:            ModeAuto,
+		OldManifestPath: oldManifestPath,
+		RemoveDeleted:   removeDeleted,
+	}
 }
 
 // TestOldManifestFixtureRoundTrips 验证测试专用编码器产出的旧清单能被生产
@@ -552,7 +577,7 @@ func TestSync_Auto_IncrementalPatch_PartialChunkMiss(t *testing.T) {
 	mtimeA, mtimeC := statA.ModTime(), statC.ModTime()
 
 	newManifest := &rman.Manifest{ManifestID: 0x2222222222222222, Files: newFiles}
-	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: true}
+	opts := managedAutoOptions(t, dir, oldManifestPath, 0x1111111111111111, oldSpecs, true)
 
 	stats, err := Sync(context.Background(), newManifest, []byte("raw-new-manifest-bytes"), "https://example.com/new.manifest", dir, newFiles, d, opts)
 	if err != nil {
@@ -626,6 +651,9 @@ func TestSync_Auto_IncrementalPatch_PartialChunkMiss(t *testing.T) {
 	if state.ManifestID != wantID {
 		t.Errorf("installed.json ManifestID = %s, want %s", state.ManifestID, wantID)
 	}
+	if wantFiles := []string{"fileA.bin", "fileB.bin", "fileC.bin"}; !slices.Equal(state.Files, wantFiles) {
+		t.Errorf("跨版本覆盖未正确携带/确认: Files=%v want=%v", state.Files, wantFiles)
+	}
 }
 
 // TestSync_Auto_Moved_ZeroDownload 验证 Moved 文件整文件本地复制、零网络请求。
@@ -644,7 +672,7 @@ func TestSync_Auto_Moved_ZeroDownload(t *testing.T) {
 	newFiles := []rman.FileEntry{makeSyncFileEntry("new-name.bin", chunk)}
 	newManifest := &rman.Manifest{ManifestID: 0x4444444444444444, Files: newFiles}
 
-	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: true}
+	opts := managedAutoOptions(t, dir, oldManifestPath, 0x3333333333333333, oldSpecs, true)
 	stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, newFiles, d, opts)
 	if err != nil {
 		t.Fatalf("Sync 失败: %v", err)
@@ -699,7 +727,7 @@ func TestSync_Auto_Removed_RespectsKeepFlag(t *testing.T) {
 			newFiles := []rman.FileEntry{makeSyncFileEntry("kept.bin", keptChunk)}
 			newManifest := &rman.Manifest{ManifestID: 0x6666666666666666, Files: newFiles}
 
-			opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: removeDeleted}
+			opts := managedAutoOptions(t, dir, oldManifestPath, 0x5555555555555555, oldSpecs, removeDeleted)
 			stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, newFiles, d, opts)
 			if err != nil {
 				t.Fatalf("Sync 失败: %v", err)
@@ -891,7 +919,12 @@ func TestSync_Auto_PartialDownloadFailure_KeepsOldFileAndDoesNotAdvanceInstalled
 	}
 	newManifest := &rman.Manifest{ManifestID: 0xDDDDDDDDDDDDDDDD, Files: newFiles}
 
-	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: true}
+	opts := Options{
+		Operation:       OperationInstall,
+		Mode:            ModeAuto,
+		OldManifestPath: oldManifestPath,
+		RemoveDeleted:   true,
+	}
 	stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, newFiles, d, opts)
 	if err != nil {
 		t.Fatalf("Sync 不应返回顶层 error（部分失败走 Stats.Failed）: %v", err)
@@ -952,7 +985,7 @@ func TestSync_Auto_SkipsCorruptedUnchanged_RepairFixes(t *testing.T) {
 	newManifest := &rman.Manifest{ManifestID: 0xFFFFFFFFFFFFFFFF, Files: newFiles}
 
 	// 第一次：ModeAuto，diff 判 Unchanged，文件级跳过、不验证——损坏未被修复。
-	autoOpts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: true}
+	autoOpts := managedAutoOptions(t, dir, oldManifestPath, 0xEEEEEEEEEEEEEEEE, oldSpecs, true)
 	autoStats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, newFiles, d, autoOpts)
 	if err != nil {
 		t.Fatalf("ModeAuto Sync 失败: %v", err)
@@ -998,11 +1031,9 @@ func TestSync_Auto_SkipsCorruptedUnchanged_RepairFixes(t *testing.T) {
 	}
 }
 
-// TestSync_Auto_Moved_SourceMissing_DiscardsStagingKeepsOthers 验证 Moved 在预分配
-// staging 之后、复制源内容之前就失败（旧路径已从磁盘消失）时：该文件计入
-// Stats.Failed 且新路径 staging 不残留、不生成最终文件；同批次里能正常提交的
-// Moved 文件不受影响，且 RemoveDeleted=true 时其旧路径被删除；
-// installed.json 不推进。
+// TestSync_Auto_Moved_SourceMissing_DiscardsStagingKeepsOthers 验证缺失的受管理 MOVE
+// 源会在规划阶段降级为 PATCH，下载失败后不残留 staging；同批次成功提交的 MOVE
+// 目标可以落盘，但因为整批未成功，旧源不清理且 installed.json 保持旧状态。
 func TestSync_Auto_Moved_SourceMissing_DiscardsStagingKeepsOthers(t *testing.T) {
 	mock := newMockFetcher()
 	d, dir := newSyncTestDownloader(t, mock)
@@ -1026,7 +1057,7 @@ func TestSync_Auto_Moved_SourceMissing_DiscardsStagingKeepsOthers(t *testing.T) 
 	}
 	newManifest := &rman.Manifest{ManifestID: 0x4141414141414141, Files: newFiles}
 
-	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: true}
+	opts := managedAutoOptions(t, dir, oldManifestPath, 0x3131313131313131, oldSpecs, true)
 	stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, newFiles, d, opts)
 	if err != nil {
 		t.Fatalf("Sync 不应返回顶层 error（部分失败走 Stats.Failed）: %v", err)
@@ -1056,13 +1087,17 @@ func TestSync_Auto_Moved_SourceMissing_DiscardsStagingKeepsOthers(t *testing.T) 
 	if !bytes.Equal(gotGood, goodData) {
 		t.Errorf("good-new.bin 内容不匹配: got %q want %q", gotGood, goodData)
 	}
-	if _, statErr := os.Stat(filepath.Join(dir, "good-old.bin")); !os.IsNotExist(statErr) {
-		t.Errorf("RemoveDeleted=true 时成功 Moved 的源路径应被删除, stat err=%v", statErr)
+	if _, statErr := os.Stat(filepath.Join(dir, "good-old.bin")); statErr != nil {
+		t.Errorf("整批存在失败时不应清理成功 Moved 的源路径, stat err=%v", statErr)
 	}
 
 	archive := NewArchive(dir)
-	if _, ok := archive.InstalledManifestPath(); ok {
-		t.Error("存在 Failed 文件时不应推进 installed.json")
+	state, loadErr := archive.LoadInstalled()
+	if loadErr != nil || state == nil {
+		t.Fatalf("旧 installed.json 应保留: state=%+v err=%v", state, loadErr)
+	}
+	if state.ManifestID != "3131313131313131" {
+		t.Errorf("存在 Failed 文件时不应推进 installed.json，got %s", state.ManifestID)
 	}
 }
 
@@ -1082,7 +1117,7 @@ func TestSync_Auto_Moved_RemoveDeletedTrue_DeletesSource(t *testing.T) {
 	newFiles := []rman.FileEntry{makeSyncFileEntry("new-name.bin", chunk)}
 	newManifest := &rman.Manifest{ManifestID: 0x6161616161616161, Files: newFiles}
 
-	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: true}
+	opts := managedAutoOptions(t, dir, oldManifestPath, 0x5151515151515151, oldSpecs, true)
 	stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, newFiles, d, opts)
 	if err != nil {
 		t.Fatalf("Sync 失败: %v", err)
@@ -1122,7 +1157,7 @@ func TestSync_Auto_Moved_RemoveDeletedFalse_KeepsSource(t *testing.T) {
 	newFiles := []rman.FileEntry{makeSyncFileEntry("new-name.bin", chunk)}
 	newManifest := &rman.Manifest{ManifestID: 0x8181818181818181, Files: newFiles}
 
-	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: false}
+	opts := managedAutoOptions(t, dir, oldManifestPath, 0x7171717171717171, oldSpecs, false)
 	stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, newFiles, d, opts)
 	if err != nil {
 		t.Fatalf("Sync 失败: %v", err)
@@ -1165,7 +1200,12 @@ func TestSync_Auto_MissesAcrossTwoBundlesOneFails_WholeFileFailedStagingDiscarde
 	newFiles := []rman.FileEntry{makeSyncFileEntry("file.bin", newC0, newC1)}
 	newManifest := &rman.Manifest{ManifestID: 0xB1B1B1B1B1B1B1B1, Files: newFiles}
 
-	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: true}
+	opts := Options{
+		Operation:       OperationInstall,
+		Mode:            ModeAuto,
+		OldManifestPath: oldManifestPath,
+		RemoveDeleted:   true,
+	}
 	stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, newFiles, d, opts)
 	if err != nil {
 		t.Fatalf("Sync 不应返回顶层 error（部分失败走 Stats.Failed）: %v", err)
@@ -1244,7 +1284,7 @@ func TestSync_Auto_FilteredRun_RemovedFromCompleteDiff_KeepsOutOfFilterFiles(t *
 	// 模拟 CLI "-p aatrox" 过滤后只剩 aatrox.bin 需要处理。
 	filteredFiles := []rman.FileEntry{allNewFiles[0]}
 
-	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: true}
+	opts := managedAutoOptions(t, dir, oldManifestPath, 0xC1C1C1C1C1C1C1C1, oldSpecs, true)
 	stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, filteredFiles, d, opts)
 	if err != nil {
 		t.Fatalf("Sync 失败: %v", err)
@@ -1310,7 +1350,7 @@ func TestSync_Auto_FilteredRun_MovedMispairingGuard_KeepsDeclaredOldPath(t *test
 	// 模拟 CLI 过滤后只剩 new-champ.bin 需要处理。
 	filteredFiles := []rman.FileEntry{allNewFiles[1]}
 
-	opts := Options{Mode: ModeAuto, OldManifestPath: oldManifestPath, RemoveDeleted: true}
+	opts := managedAutoOptions(t, dir, oldManifestPath, 0xC4C4C4C4C4C4C4C4, oldSpecs, true)
 	stats, err := Sync(context.Background(), newManifest, []byte("raw"), "src", dir, filteredFiles, d, opts)
 	if err != nil {
 		t.Fatalf("Sync 失败: %v", err)
@@ -1333,5 +1373,425 @@ func TestSync_Auto_FilteredRun_MovedMispairingGuard_KeepsDeclaredOldPath(t *test
 	}
 	if !bytes.Equal(gotNewChamp, sharedData) {
 		t.Errorf("new-champ.bin 内容不匹配: got %q want %q", gotNewChamp, sharedData)
+	}
+}
+
+func TestSync_StandaloneRepeatedSelectionsRemainIndependent(t *testing.T) {
+	mock := newMockFetcher()
+	d, dir := newSyncTestDownloader(t, mock)
+
+	const bundleID uint64 = 0xD100000000000001
+	firstChunk := makeSyncChunk(t, []byte("standalone-first-file"), bundleID, 0)
+	secondChunk := makeSyncChunk(t, []byte("standalone-second-file"), bundleID, firstChunk.info.CompressedSize)
+	mock.addChunk(firstChunk.info.ChunkID, bundleID, firstChunk.info.BundleOffset, firstChunk.compressed)
+	mock.addChunk(secondChunk.info.ChunkID, bundleID, secondChunk.info.BundleOffset, secondChunk.compressed)
+
+	allFiles := []rman.FileEntry{
+		makeSyncFileEntry("description.json", firstChunk),
+		makeSyncFileEntry("game.wad.client", secondChunk),
+	}
+	manifest := &rman.Manifest{ManifestID: 0xD1D1D1D1D1D1D1D1, Files: allFiles}
+
+	for _, target := range allFiles {
+		stats, err := Sync(context.Background(), manifest, []byte("unused"), "src", dir,
+			[]rman.FileEntry{target}, d, Options{Mode: ModeAuto})
+		if err != nil {
+			t.Fatalf("standalone Sync(%s) 失败: %v", target.Path, err)
+		}
+		if len(stats.Failed) != 0 {
+			t.Fatalf("standalone Sync(%s) Failed=%v", target.Path, stats.Failed)
+		}
+	}
+
+	for _, target := range allFiles {
+		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(target.Path))); err != nil {
+			t.Errorf("standalone 目标 %s 未落盘: %v", target.Path, err)
+		}
+	}
+	if exists, err := NewArchive(dir).HasInstalledState(); err != nil || exists {
+		t.Errorf("standalone 不应创建 installed.json: exists=%v err=%v", exists, err)
+	}
+}
+
+func TestSync_ManagedPartialInstallAccumulatesAndRepairsMissingMember(t *testing.T) {
+	mock := newMockFetcher()
+	d, dir := newSyncTestDownloader(t, mock)
+
+	const bundleID uint64 = 0xD200000000000001
+	firstChunk := makeSyncChunk(t, []byte("managed-description-file"), bundleID, 0)
+	secondChunk := makeSyncChunk(t, []byte("managed-game-wad-file"), bundleID, firstChunk.info.CompressedSize)
+	mock.addChunk(firstChunk.info.ChunkID, bundleID, firstChunk.info.BundleOffset, firstChunk.compressed)
+	mock.addChunk(secondChunk.info.ChunkID, bundleID, secondChunk.info.BundleOffset, secondChunk.compressed)
+
+	allFiles := []rman.FileEntry{
+		makeSyncFileEntry("description.json", firstChunk),
+		makeSyncFileEntry("game.wad.client", secondChunk),
+	}
+	specs := []oldFileSpec{
+		{path: allFiles[0].Path, chunkIDs: []uint64{firstChunk.info.ChunkID}},
+		{path: allFiles[1].Path, chunkIDs: []uint64{secondChunk.info.ChunkID}},
+	}
+	manifestID := uint64(0xD2D2D2D2D2D2D2D2)
+	manifestPath := writeOldManifestFile(t, dir, manifestID, specs)
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("读取测试 manifest 失败: %v", err)
+	}
+	manifest := &rman.Manifest{ManifestID: manifestID, Files: allFiles}
+	opts := Options{Operation: OperationInstall, Mode: ModeAuto, RemoveDeleted: true}
+
+	if _, err := Sync(context.Background(), manifest, raw, "src", dir,
+		[]rman.FileEntry{allFiles[0]}, d, opts); err != nil {
+		t.Fatalf("第一次部分安装失败: %v", err)
+	}
+	state, err := NewArchive(dir).LoadInstalled()
+	if err != nil || state == nil {
+		t.Fatalf("读取第一次安装状态失败: state=%+v err=%v", state, err)
+	}
+	if len(state.Files) != 1 || state.Files[0] != "description.json" {
+		t.Fatalf("第一次 Files=%v, want [description.json]", state.Files)
+	}
+
+	if _, err := Sync(context.Background(), manifest, raw, "src", dir,
+		[]rman.FileEntry{allFiles[1]}, d, opts); err != nil {
+		t.Fatalf("第二次部分安装失败: %v", err)
+	}
+	state, err = NewArchive(dir).LoadInstalled()
+	if err != nil || state == nil {
+		t.Fatalf("读取第二次安装状态失败: state=%+v err=%v", state, err)
+	}
+	wantFiles := []string{"description.json", "game.wad.client"}
+	if !slices.Equal(state.Files, wantFiles) {
+		t.Fatalf("累积 Files=%v, want %v", state.Files, wantFiles)
+	}
+
+	if err := os.Remove(filepath.Join(dir, "game.wad.client")); err != nil {
+		t.Fatalf("删除受管理目标失败: %v", err)
+	}
+	beforeCalls := mock.callCount
+	stats, err := Sync(context.Background(), manifest, raw, "src", dir,
+		[]rman.FileEntry{allFiles[1]}, d, opts)
+	if err != nil {
+		t.Fatalf("修复缺失成员失败: %v", err)
+	}
+	if mock.callCount <= beforeCalls {
+		t.Error("state-listed 但磁盘缺失的文件必须重新下载")
+	}
+	if len(stats.Created) != 1 || stats.Created[0] != "game.wad.client" {
+		t.Errorf("缺失成员应重新创建，stats=%+v", stats)
+	}
+}
+
+func TestSync_ManagedCleanupOnlyDeletesOwnedPaths(t *testing.T) {
+	mock := newMockFetcher()
+	d, dir := newSyncTestDownloader(t, mock)
+
+	managedData := []byte("owned-obsolete-file")
+	unmanagedData := []byte("unmanaged-obsolete-file")
+	managedChunk := makeSyncChunk(t, managedData, 0, 0)
+	unmanagedChunk := makeSyncChunk(t, unmanagedData, 0, 0)
+	writeFile(t, dir, "managed-old.bin", managedData)
+	writeFile(t, dir, "unmanaged-old.bin", unmanagedData)
+
+	oldID := uint64(0xD3D3D3D3D3D3D3D3)
+	oldSpecs := []oldFileSpec{
+		{path: "managed-old.bin", chunkIDs: []uint64{managedChunk.info.ChunkID}},
+		{path: "unmanaged-old.bin", chunkIDs: []uint64{unmanagedChunk.info.ChunkID}},
+	}
+	oldManifestPath := writeOldManifestFile(t, dir, oldID, oldSpecs)
+	raw, err := os.ReadFile(oldManifestPath)
+	if err != nil {
+		t.Fatalf("读取旧清单失败: %v", err)
+	}
+	if err := NewArchive(dir).Save(oldID, raw, "src", []string{"managed-old.bin"}); err != nil {
+		t.Fatalf("保存旧状态失败: %v", err)
+	}
+
+	newManifest := &rman.Manifest{ManifestID: 0xD4D4D4D4D4D4D4D4}
+	opts := Options{Operation: OperationInstall, Mode: ModeAuto, RemoveDeleted: true}
+	stats, err := Sync(context.Background(), newManifest, []byte("new"), "src", dir, nil, d, opts)
+	if err != nil {
+		t.Fatalf("受管理清理失败: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "managed-old.bin")); !os.IsNotExist(err) {
+		t.Errorf("已管理 obsolete 路径应删除: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "unmanaged-old.bin")); err != nil {
+		t.Errorf("未管理 obsolete 路径不得删除: %v", err)
+	}
+	if !slices.Equal(stats.Removed, []string{"managed-old.bin"}) {
+		t.Errorf("Removed=%v, want [managed-old.bin]", stats.Removed)
+	}
+}
+
+func TestSync_LegacySchema1UsesManifestHintWithoutSkipAuthority(t *testing.T) {
+	mock := newMockFetcher()
+	d, dir := newSyncTestDownloader(t, mock)
+
+	const bundleID uint64 = 0xD500000000000001
+	goodData := []byte("legacy-state-must-reverify-this-file")
+	chunk := makeSyncChunk(t, goodData, bundleID, 0)
+	mock.addChunk(chunk.info.ChunkID, bundleID, chunk.info.BundleOffset, chunk.compressed)
+
+	corrupted := append([]byte(nil), goodData...)
+	corrupted[0] ^= 0xFF
+	writeFile(t, dir, "file.bin", corrupted)
+
+	manifestID := uint64(0xD5D5D5D5D5D5D5D5)
+	specs := []oldFileSpec{{path: "file.bin", chunkIDs: []uint64{chunk.info.ChunkID}}}
+	manifestPath := writeOldManifestFile(t, dir, manifestID, specs)
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("读取 manifest 失败: %v", err)
+	}
+	archive := NewArchive(dir)
+	if err := archive.Save(manifestID, raw, "src", []string{"file.bin"}); err != nil {
+		t.Fatalf("建立测试 archive 失败: %v", err)
+	}
+
+	legacyPayload := fmt.Sprintf(`{
+  "schema": 1,
+  "manifest_id": "%016X",
+  "manifest_file": "manifests/%016X.manifest",
+  "source": "src",
+  "updated_at": "2026-01-01T00:00:00Z"
+}`, manifestID, manifestID)
+	if err := os.WriteFile(filepath.Join(dir, ".rman", "installed.json"), []byte(legacyPayload), 0644); err != nil {
+		t.Fatalf("写入 legacy state 失败: %v", err)
+	}
+
+	entry := makeSyncFileEntry("file.bin", chunk)
+	manifest := &rman.Manifest{ManifestID: manifestID, Files: []rman.FileEntry{entry}}
+	stats, err := Sync(context.Background(), manifest, raw, "src", dir,
+		[]rman.FileEntry{entry}, d,
+		Options{Operation: OperationInstall, Mode: ModeAuto, RemoveDeleted: true})
+	if err != nil {
+		t.Fatalf("legacy 升级 Sync 失败: %v", err)
+	}
+	if len(stats.Patched) != 1 || stats.Patched[0] != "file.bin" {
+		t.Fatalf("schema 1 不得授权 skip，stats=%+v", stats)
+	}
+
+	state, err := archive.LoadInstalled()
+	if err != nil || state == nil {
+		t.Fatalf("读取升级后状态失败: state=%+v err=%v", state, err)
+	}
+	if state.Schema != 2 || !slices.Equal(state.Files, []string{"file.bin"}) {
+		t.Errorf("升级后 state=%+v, want schema2 Files=[file.bin]", state)
+	}
+}
+
+func TestSync_UnmanagedMoveSourceIsDownloadedAndPreserved(t *testing.T) {
+	mock := newMockFetcher()
+	d, dir := newSyncTestDownloader(t, mock)
+
+	const bundleID uint64 = 0xD600000000000001
+	data := []byte("unmanaged-move-source-content")
+	chunk := makeSyncChunk(t, data, bundleID, 0)
+	mock.addChunk(chunk.info.ChunkID, bundleID, chunk.info.BundleOffset, chunk.compressed)
+	writeFile(t, dir, "old-name.bin", data)
+
+	oldID := uint64(0xD6D6D6D6D6D6D6D6)
+	oldSpecs := []oldFileSpec{{path: "old-name.bin", chunkIDs: []uint64{chunk.info.ChunkID}}}
+	oldManifestPath := writeOldManifestFile(t, dir, oldID, oldSpecs)
+	raw, err := os.ReadFile(oldManifestPath)
+	if err != nil {
+		t.Fatalf("读取旧清单失败: %v", err)
+	}
+	if err := NewArchive(dir).Save(oldID, raw, "src", nil); err != nil {
+		t.Fatalf("保存空覆盖旧状态失败: %v", err)
+	}
+
+	entry := makeSyncFileEntry("new-name.bin", chunk)
+	newManifest := &rman.Manifest{ManifestID: 0xD7D7D7D7D7D7D7D7, Files: []rman.FileEntry{entry}}
+	stats, err := Sync(context.Background(), newManifest, []byte("new"), "src", dir,
+		[]rman.FileEntry{entry}, d,
+		Options{Operation: OperationInstall, Mode: ModeAuto, RemoveDeleted: true})
+	if err != nil {
+		t.Fatalf("Sync 失败: %v", err)
+	}
+	if len(stats.Moved) != 0 || len(stats.Created) != 1 {
+		t.Fatalf("未管理 MOVE 源必须退化为下载，stats=%+v", stats)
+	}
+	if mock.callCount == 0 {
+		t.Error("未管理 MOVE 源不得零网络复用")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "old-name.bin")); err != nil {
+		t.Errorf("未管理 MOVE 源不得清理: %v", err)
+	}
+}
+
+func TestSync_CleanupErrorKeepsPreviousState(t *testing.T) {
+	mock := newMockFetcher()
+	d, dir := newSyncTestDownloader(t, mock)
+
+	oldPath := filepath.Join(dir, "old.bin")
+	if err := os.Mkdir(oldPath, 0755); err != nil {
+		t.Fatalf("建立非普通旧路径失败: %v", err)
+	}
+
+	oldID := uint64(0xD8D8D8D8D8D8D8D8)
+	oldSpecs := []oldFileSpec{{path: "old.bin"}}
+	oldManifestPath := writeOldManifestFile(t, dir, oldID, oldSpecs)
+	raw, err := os.ReadFile(oldManifestPath)
+	if err != nil {
+		t.Fatalf("读取旧清单失败: %v", err)
+	}
+	archive := NewArchive(dir)
+	if err := archive.Save(oldID, raw, "src", []string{"old.bin"}); err != nil {
+		t.Fatalf("保存旧状态失败: %v", err)
+	}
+
+	newManifest := &rman.Manifest{ManifestID: 0xD9D9D9D9D9D9D9D9}
+	_, err = Sync(context.Background(), newManifest, []byte("new"), "src", dir, nil, d,
+		Options{Operation: OperationInstall, Mode: ModeAuto, RemoveDeleted: true})
+	if err == nil {
+		t.Fatal("非普通受管理清理目标应使状态转换失败")
+	}
+
+	state, loadErr := archive.LoadInstalled()
+	if loadErr != nil || state == nil {
+		t.Fatalf("读取旧状态失败: state=%+v err=%v", state, loadErr)
+	}
+	if state.ManifestID != fmt.Sprintf("%016X", oldID) {
+		t.Errorf("清理失败后状态被推进: %+v", state)
+	}
+}
+
+func TestSync_AutoMoveGateFailurePatchesThenCleansOwnedSource(t *testing.T) {
+	mock := newMockFetcher()
+	d, dir := newSyncTestDownloader(t, mock)
+
+	const bundleID uint64 = 0xDA00000000000001
+	data := []byte("correct-moved-content")
+	chunk := makeSyncChunk(t, data, bundleID, 0)
+	mock.addChunk(chunk.info.ChunkID, bundleID, chunk.info.BundleOffset, chunk.compressed)
+	writeFile(t, dir, "old-name.bin", []byte("wrong-size"))
+
+	oldID := uint64(0xDADADADADADADADA)
+	oldSpecs := []oldFileSpec{{path: "old-name.bin", chunkIDs: []uint64{chunk.info.ChunkID}}}
+	oldManifestPath := writeOldManifestFile(t, dir, oldID, oldSpecs)
+	raw, err := os.ReadFile(oldManifestPath)
+	if err != nil {
+		t.Fatalf("读取旧清单失败: %v", err)
+	}
+	if err := NewArchive(dir).Save(oldID, raw, "src", []string{"old-name.bin"}); err != nil {
+		t.Fatalf("保存旧状态失败: %v", err)
+	}
+
+	entry := makeSyncFileEntry("new-name.bin", chunk)
+	stats, err := Sync(context.Background(),
+		&rman.Manifest{ManifestID: 0xDBDBDBDBDBDBDBDB, Files: []rman.FileEntry{entry}},
+		[]byte("new"), "src", dir, []rman.FileEntry{entry}, d,
+		Options{Operation: OperationInstall, Mode: ModeAuto, RemoveDeleted: true})
+	if err != nil {
+		t.Fatalf("Sync 失败: %v", err)
+	}
+	if len(stats.Moved) != 0 || len(stats.Created) != 1 {
+		t.Fatalf("MOVE size gate 失败后应 PATCH/CREATE，stats=%+v", stats)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "old-name.bin")); !os.IsNotExist(err) {
+		t.Errorf("PATCH 成功后应清理受管理 Moved 旧源: %v", err)
+	}
+}
+
+func TestSync_ManagedNonAutoStrategiesKeepCleanupAuthority(t *testing.T) {
+	for _, mode := range []Mode{ModeRepair, ModeForceFull} {
+		t.Run(fmt.Sprintf("mode=%d", mode), func(t *testing.T) {
+			mock := newMockFetcher()
+			d, dir := newSyncTestDownloader(t, mock)
+
+			removedData := []byte("owned-removed-content")
+			removedChunk := makeSyncChunk(t, removedData, 0, 0)
+			movedData := []byte("owned-moved-content")
+			const bundleID uint64 = 0xDC00000000000001
+			movedChunk := makeSyncChunk(t, movedData, bundleID, 0)
+			mock.addChunk(movedChunk.info.ChunkID, bundleID, movedChunk.info.BundleOffset, movedChunk.compressed)
+
+			writeFile(t, dir, "removed.bin", removedData)
+			writeFile(t, dir, "old-name.bin", movedData)
+
+			oldID := uint64(0xDCDCDCDCDCDCDCDC)
+			oldSpecs := []oldFileSpec{
+				{path: "removed.bin", chunkIDs: []uint64{removedChunk.info.ChunkID}},
+				{path: "old-name.bin", chunkIDs: []uint64{movedChunk.info.ChunkID}},
+			}
+			oldManifestPath := writeOldManifestFile(t, dir, oldID, oldSpecs)
+			raw, err := os.ReadFile(oldManifestPath)
+			if err != nil {
+				t.Fatalf("读取旧清单失败: %v", err)
+			}
+			if err := NewArchive(dir).Save(oldID, raw, "src",
+				[]string{"removed.bin", "old-name.bin"}); err != nil {
+				t.Fatalf("保存旧状态失败: %v", err)
+			}
+
+			entry := makeSyncFileEntry("new-name.bin", movedChunk)
+			stats, err := Sync(context.Background(),
+				&rman.Manifest{ManifestID: 0xDDDDDDDDDDDDDDDD, Files: []rman.FileEntry{entry}},
+				[]byte("new"), "src", dir, []rman.FileEntry{entry}, d,
+				Options{Operation: OperationInstall, Mode: mode, RemoveDeleted: true})
+			if err != nil {
+				t.Fatalf("Sync 失败: %v", err)
+			}
+			if len(stats.Moved) != 0 || len(stats.Created) != 1 {
+				t.Fatalf("非 AUTO 不应走 MOVE 复用，stats=%+v", stats)
+			}
+			if !slices.Equal(stats.Removed, []string{"removed.bin"}) {
+				t.Errorf("真实 Removed 未清理: %v", stats.Removed)
+			}
+			for _, oldPath := range []string{"removed.bin", "old-name.bin"} {
+				if _, err := os.Stat(filepath.Join(dir, oldPath)); !os.IsNotExist(err) {
+					t.Errorf("%s 应在成功状态转换后清理: %v", oldPath, err)
+				}
+			}
+		})
+	}
+}
+
+func TestSync_MatchingManagedStatePrecedesStaleExplicitHint(t *testing.T) {
+	mock := newMockFetcher()
+	d, dir := newSyncTestDownloader(t, mock)
+
+	const bundleID uint64 = 0xDE00000000000001
+	firstChunk := makeSyncChunk(t, []byte("first-managed-file"), bundleID, 0)
+	secondChunk := makeSyncChunk(t, []byte("second-managed-file"), bundleID, firstChunk.info.CompressedSize)
+	mock.addChunk(firstChunk.info.ChunkID, bundleID, firstChunk.info.BundleOffset, firstChunk.compressed)
+	mock.addChunk(secondChunk.info.ChunkID, bundleID, secondChunk.info.BundleOffset, secondChunk.compressed)
+
+	allFiles := []rman.FileEntry{
+		makeSyncFileEntry("first.bin", firstChunk),
+		makeSyncFileEntry("second.bin", secondChunk),
+	}
+	manifestID := uint64(0xDEDEDEDEDEDEDEDE)
+	currentPath := writeOldManifestFile(t, dir, manifestID, []oldFileSpec{
+		{path: "first.bin", chunkIDs: []uint64{firstChunk.info.ChunkID}},
+		{path: "second.bin", chunkIDs: []uint64{secondChunk.info.ChunkID}},
+	})
+	currentRaw, err := os.ReadFile(currentPath)
+	if err != nil {
+		t.Fatalf("读取当前清单失败: %v", err)
+	}
+	manifest := &rman.Manifest{ManifestID: manifestID, Files: allFiles}
+	baseOpts := Options{Operation: OperationInstall, Mode: ModeAuto, RemoveDeleted: true}
+	if _, err := Sync(context.Background(), manifest, currentRaw, "src", dir,
+		[]rman.FileEntry{allFiles[0]}, d, baseOpts); err != nil {
+		t.Fatalf("首次安装失败: %v", err)
+	}
+
+	stalePath := writeOldManifestFile(t, dir, 0xDFDFDFDFDFDFDFDF, nil)
+	secondOpts := baseOpts
+	secondOpts.OldManifestPath = stalePath
+	if _, err := Sync(context.Background(), manifest, currentRaw, "src", dir,
+		[]rman.FileEntry{allFiles[1]}, d, secondOpts); err != nil {
+		t.Fatalf("带 stale hint 的第二次安装失败: %v", err)
+	}
+
+	state, err := NewArchive(dir).LoadInstalled()
+	if err != nil || state == nil {
+		t.Fatalf("读取最终状态失败: state=%+v err=%v", state, err)
+	}
+	if want := []string{"first.bin", "second.bin"}; !slices.Equal(state.Files, want) {
+		t.Errorf("stale explicit hint 不应覆盖 managed state: Files=%v want=%v", state.Files, want)
 	}
 }

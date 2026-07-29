@@ -26,7 +26,11 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	raw := []byte("fake manifest bytes")
 	source := "https://lol.secure.dyn.riotcdn.net/channels/public/releases/037EC59D5BD7C5D3.manifest"
 
-	if err := archive.Save(manifestID, raw, source); err != nil {
+	if err := archive.Save(manifestID, raw, source, []string{
+		"DATA\\Shipping.wad.client",
+		"Config/description.json",
+		"Config/description.json",
+	}); err != nil {
 		t.Fatalf("Save 失败: %v", err)
 	}
 
@@ -38,8 +42,8 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		t.Fatal("LoadInstalled 返回 nil，期望有效状态")
 	}
 
-	if state.Schema != 1 {
-		t.Errorf("Schema = %d, want 1", state.Schema)
+	if state.Schema != 2 {
+		t.Errorf("Schema = %d, want 2", state.Schema)
 	}
 	wantManifestID := "037EC59D5BD7C5D3"
 	if state.ManifestID != wantManifestID {
@@ -57,6 +61,15 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if !strings.HasSuffix(state.UpdatedAt, "Z") {
 		t.Errorf("UpdatedAt 期望为 UTC（以 Z 结尾）: %q", state.UpdatedAt)
+	}
+	wantFiles := []string{"Config/description.json", "DATA/Shipping.wad.client"}
+	if len(state.Files) != len(wantFiles) {
+		t.Fatalf("Files = %v, want %v", state.Files, wantFiles)
+	}
+	for i := range wantFiles {
+		if state.Files[i] != wantFiles[i] {
+			t.Errorf("Files[%d] = %q, want %q", i, state.Files[i], wantFiles[i])
+		}
 	}
 
 	// 校验落盘的 manifest 原始字节内容
@@ -116,7 +129,106 @@ func TestLoadInstalled_CorruptJSON(t *testing.T) {
 	}
 }
 
-// TestLoadInstalled_UnknownSchema 验证 schema 字段不为 1 时视为无状态，返回 (nil, nil)。
+// TestLoadInstalled_LegacySchema1KeepsManifestHintWithoutCoverage 验证 schema 1
+// 仍可提供旧 manifest 指针，但不能携带任何可信文件覆盖。
+func TestLoadInstalled_LegacySchema1KeepsManifestHintWithoutCoverage(t *testing.T) {
+	archive, outputDir := newTempArchive(t)
+	rmanDir := filepath.Join(outputDir, ".rman")
+	if err := os.MkdirAll(rmanDir, 0755); err != nil {
+		t.Fatalf("创建 .rman 目录失败: %v", err)
+	}
+
+	payload := []byte(`{
+  "schema": 1,
+  "manifest_id": "037EC59D5BD7C5D3",
+  "manifest_file": "manifests/037EC59D5BD7C5D3.manifest",
+  "source": "https://example.com/x.manifest",
+  "updated_at": "2026-01-01T00:00:00Z",
+  "files": ["must-not-be-trusted.bin"]
+}`)
+	if err := os.WriteFile(filepath.Join(rmanDir, "installed.json"), payload, 0644); err != nil {
+		t.Fatalf("写入 installed.json 失败: %v", err)
+	}
+
+	state, err := archive.LoadInstalled()
+	if err != nil {
+		t.Fatalf("LoadInstalled 返回 error: %v", err)
+	}
+	if state == nil || state.Schema != 1 {
+		t.Fatalf("legacy state = %+v, want schema 1", state)
+	}
+	if state.ManifestFile != "manifests/037EC59D5BD7C5D3.manifest" {
+		t.Errorf("ManifestFile = %q", state.ManifestFile)
+	}
+	if len(state.Files) != 0 {
+		t.Errorf("schema 1 Files 必须为空，got %v", state.Files)
+	}
+}
+
+func TestLoadInstalled_Schema2RequiresFilesArray(t *testing.T) {
+	cases := map[string]string{
+		"missing": `{
+  "schema": 2,
+  "manifest_id": "037EC59D5BD7C5D3",
+  "manifest_file": "manifests/037EC59D5BD7C5D3.manifest",
+  "source": "https://example.com/x.manifest",
+  "updated_at": "2026-01-01T00:00:00Z"
+}`,
+		"null": `{
+  "schema": 2,
+  "manifest_id": "037EC59D5BD7C5D3",
+  "manifest_file": "manifests/037EC59D5BD7C5D3.manifest",
+  "source": "https://example.com/x.manifest",
+  "updated_at": "2026-01-01T00:00:00Z",
+  "files": null
+}`,
+	}
+
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			archive, outputDir := newTempArchive(t)
+			rmanDir := filepath.Join(outputDir, ".rman")
+			if err := os.MkdirAll(rmanDir, 0755); err != nil {
+				t.Fatalf("创建 .rman 目录失败: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(rmanDir, "installed.json"), []byte(payload), 0644); err != nil {
+				t.Fatalf("写入 installed.json 失败: %v", err)
+			}
+
+			state, err := archive.LoadInstalled()
+			if err != nil {
+				t.Fatalf("LoadInstalled 返回 error: %v", err)
+			}
+			if state != nil {
+				t.Errorf("schema 2 files %s 应视为无状态，got %+v", name, state)
+			}
+		})
+	}
+}
+
+func TestSaveNilFilesWritesExplicitEmptyArray(t *testing.T) {
+	archive, outputDir := newTempArchive(t)
+	if err := archive.Save(0x037EC59D5BD7C5D3, []byte("raw"), "src", nil); err != nil {
+		t.Fatalf("Save 失败: %v", err)
+	}
+
+	payload, err := os.ReadFile(filepath.Join(outputDir, ".rman", "installed.json"))
+	if err != nil {
+		t.Fatalf("读取 installed.json 失败: %v", err)
+	}
+	if !strings.Contains(string(payload), `"files": []`) {
+		t.Errorf("Save(nil) 必须写出显式空数组，got:\n%s", payload)
+	}
+	state, err := archive.LoadInstalled()
+	if err != nil || state == nil {
+		t.Fatalf("显式空数组应是有效 schema 2 状态: state=%+v err=%v", state, err)
+	}
+	if state.Files == nil || len(state.Files) != 0 {
+		t.Errorf("Files = %#v, want non-nil empty slice", state.Files)
+	}
+}
+
+// TestLoadInstalled_UnknownSchema 验证未知 schema 视为无状态，返回 (nil, nil)。
 func TestLoadInstalled_UnknownSchema(t *testing.T) {
 	archive, outputDir := newTempArchive(t)
 	rmanDir := filepath.Join(outputDir, ".rman")
@@ -125,7 +237,7 @@ func TestLoadInstalled_UnknownSchema(t *testing.T) {
 	}
 
 	payload, err := json.Marshal(map[string]any{
-		"schema":        2,
+		"schema":        3,
 		"manifest_id":   "037EC59D5BD7C5D3",
 		"manifest_file": "manifests/037EC59D5BD7C5D3.manifest",
 		"source":        "https://example.com/x.manifest",
@@ -154,7 +266,7 @@ func TestSaveRetainsOnlyLatestTwoManifests(t *testing.T) {
 
 	ids := []uint64{0x1111111111111111, 0x2222222222222222, 0x3333333333333333}
 	for i, id := range ids {
-		if err := archive.Save(id, []byte(fmt.Sprintf("manifest-%d", i)), "source"); err != nil {
+		if err := archive.Save(id, []byte(fmt.Sprintf("manifest-%d", i)), "source", []string{"file.bin"}); err != nil {
 			t.Fatalf("第 %d 次 Save 失败: %v", i+1, err)
 		}
 	}
@@ -222,7 +334,7 @@ func TestSaveAtomicity_TmpWriteFailureLeavesInstalledIntact(t *testing.T) {
 		t.Fatalf("预置冲突目录失败: %v", err)
 	}
 
-	err := archive.Save(0xBBBBBBBBBBBBBBBB, []byte("new raw"), "https://example.com/new.manifest")
+	err := archive.Save(0xBBBBBBBBBBBBBBBB, []byte("new raw"), "https://example.com/new.manifest", []string{"file.bin"})
 	if err == nil {
 		t.Fatal("期望 Save 返回 error（临时文件写入应失败），实际为 nil")
 	}

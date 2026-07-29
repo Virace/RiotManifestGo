@@ -27,6 +27,7 @@ type mockFetcher struct {
 	fetchError      error                                                             // 始终返回的 error（优先于 failUntil）
 	rangeFunc       func(bundleFilename string, ranges []ByteRange) ([][]byte, error) // 优先于 responses：按实际请求的 Range 精确应答，用于断言"只请求了预期的字节区间"
 	requestedRanges []ByteRange                                                       // 记录所有调用中实际收到的 ranges，用于断言子集下载未越界请求
+	requestedOpts   []FetchOptions                                                    // 记录每次调用收到的 FetchOptions，用于断言 URLHint 轮转与整包透传
 }
 
 type rangeResp struct {
@@ -39,11 +40,12 @@ func newMockFetcher() *mockFetcher {
 	}
 }
 
-func (m *mockFetcher) FetchRanges(ctx context.Context, bundleFilename string, ranges []ByteRange) ([][]byte, error) {
+func (m *mockFetcher) FetchRanges(ctx context.Context, bundleFilename string, ranges []ByteRange, opts FetchOptions) ([][]byte, error) {
 	m.mu.Lock()
 	m.callCount++
 	count := m.callCount
 	m.requestedRanges = append(m.requestedRanges, ranges...)
+	m.requestedOpts = append(m.requestedOpts, opts)
 	rangeFunc := m.rangeFunc
 	m.mu.Unlock()
 
@@ -1068,4 +1070,280 @@ func TestNewDownloaderDefaultRetryWait(t *testing.T) {
 	if dl.config.RetryWait != time.Second {
 		t.Errorf("RetryWait 零值应默认 1s，实际 %v", dl.config.RetryWait)
 	}
+}
+
+// ---- FetchOptions 接线：整包判定、域名轮转、实际字节口径 ----
+
+// TestFullBundleEndToEnd 验证 DownloadConfig 携带 BundleSizes+FullBundleThreshold
+// 且覆盖率达标时：BundleFetcher 收到的 FetchOptions.FullBundleSize>0，请求的
+// Range 是 Schedule 合并后的结果（跨 Gap 的单段，而非按 Chunk 拆分的多段），
+// 且最终落盘数据仍然正确（gap 部分的垃圾字节不会被误写入文件）。
+func TestFullBundleEndToEnd(t *testing.T) {
+	config, dir := makeTestConfig(t)
+
+	const bundleID uint64 = 0x7000000000000001
+	const gapFillerSize = 5
+
+	chunk0Data := []byte("full bundle chunk zero data!!!!")
+	chunk1Data := []byte("full bundle chunk one data!!!!!")
+
+	chunk0 := makeTestChunk(t, chunk0Data, bundleID, 0)
+	chunk1 := makeTestChunk(t, chunk1Data, bundleID, chunk0.compSize+gapFillerSize)
+
+	file := makeTestFileEntry("fullbundle/output.bin", chunk0, chunk1)
+
+	mergedSpan := int64(chunk1.bundleOffset) + int64(chunk1.compSize)
+
+	mock := newMockFetcher()
+	mock.rangeFunc = func(bundleFilename string, ranges []ByteRange) ([][]byte, error) {
+		if len(ranges) != 1 {
+			return nil, fmt.Errorf("mock: 期望合并为 1 段 Range，实际 %d 段", len(ranges))
+		}
+		if ranges[0].Start != 0 || ranges[0].End != mergedSpan-1 {
+			return nil, fmt.Errorf("mock: 期望合并区间 [0,%d]，实际 [%d,%d]", mergedSpan-1, ranges[0].Start, ranges[0].End)
+		}
+		var buf bytes.Buffer
+		buf.Write(chunk0.compressed)
+		buf.Write(bytes.Repeat([]byte{0xFF}, gapFillerSize)) // gap 内的垃圾字节，不应落盘
+		buf.Write(chunk1.compressed)
+		return [][]byte{buf.Bytes()}, nil
+	}
+
+	config.GapTolerance = gapFillerSize
+	config.FullBundleThreshold = SuggestedFullBundleThreshold
+	config.BundleSizes = map[uint64]uint32{bundleID: uint32(mergedSpan)}
+
+	dl := NewDownloaderWithFetcher(config, mock)
+	events := dl.Events()
+
+	var eventList []DownloadEvent
+	var eventWg sync.WaitGroup
+	eventWg.Add(1)
+	go func() {
+		defer eventWg.Done()
+		for ev := range events {
+			eventList = append(eventList, ev)
+		}
+	}()
+
+	err := dl.Download(context.Background(), []rman.FileEntry{file})
+	eventWg.Wait()
+
+	if err != nil {
+		t.Fatalf("Download 失败: %v", err)
+	}
+
+	mock.mu.Lock()
+	opts := append([]FetchOptions(nil), mock.requestedOpts...)
+	mock.mu.Unlock()
+	if len(opts) != 1 {
+		t.Fatalf("期望 1 次 FetchRanges 调用，实际 %d 次", len(opts))
+	}
+	if opts[0].FullBundleSize != mergedSpan {
+		t.Errorf("FetchOptions.FullBundleSize = %d, 期望 %d", opts[0].FullBundleSize, mergedSpan)
+	}
+
+	var hasBundleStart bool
+	for _, ev := range eventList {
+		if start, ok := ev.(EventBundleStart); ok {
+			hasBundleStart = true
+			if !start.FullBundle {
+				t.Error("EventBundleStart.FullBundle 应为 true")
+			}
+		}
+	}
+	if !hasBundleStart {
+		t.Fatal("缺少 EventBundleStart 事件")
+	}
+
+	content, err := os.ReadFile(filepath.Join(dir, "fullbundle", "output.bin"))
+	if err != nil {
+		t.Fatalf("读取输出文件失败: %v", err)
+	}
+	expected := append(append([]byte{}, chunk0Data...), chunk1Data...)
+	if !bytes.Equal(content, expected) {
+		t.Errorf("文件内容不匹配:\n  实际: %q\n  期望: %q", content, expected)
+	}
+}
+
+// TestRetryRotatesURLHint 验证重试时 attempt 递增使相邻两次 FetchOptions.URLHint
+// 相差 1（统一公式 URLHint = BundleID + attempt）。
+func TestRetryRotatesURLHint(t *testing.T) {
+	config, _ := makeTestConfig(t)
+	config.RetryWait = 10 * time.Millisecond
+
+	const bundleID uint64 = 0x7100000000000001
+	chunk := makeTestChunk(t, []byte("retry url hint rotation data!!!"), bundleID, 0)
+	file := makeTestFileEntry("urlhint/retry.bin", chunk)
+
+	mock := newMockFetcher()
+	mock.failUntil = 1 // 第 1 次（attempt=0）失败，第 2 次（attempt=1）成功
+	setupMockResponse(t, mock, bundleID, chunk)
+
+	dl := NewDownloaderWithFetcher(config, mock)
+	events := dl.Events()
+	var eventWg sync.WaitGroup
+	eventWg.Add(1)
+	go func() {
+		defer eventWg.Done()
+		for range events {
+		}
+	}()
+
+	err := dl.Download(context.Background(), []rman.FileEntry{file})
+	eventWg.Wait()
+
+	if err != nil {
+		t.Fatalf("Download 应在重试后成功，但失败: %v", err)
+	}
+
+	mock.mu.Lock()
+	opts := append([]FetchOptions(nil), mock.requestedOpts...)
+	mock.mu.Unlock()
+	if len(opts) != 2 {
+		t.Fatalf("期望 2 次 FetchRanges 调用，实际 %d 次", len(opts))
+	}
+	if opts[1].URLHint-opts[0].URLHint != 1 {
+		t.Errorf("两次 URLHint 应相差 1: 第1次=%d 第2次=%d", opts[0].URLHint, opts[1].URLHint)
+	}
+	if opts[0].URLHint != bundleID {
+		t.Errorf("首次 URLHint 应等于 BundleID: 实际=%d 期望=%d", opts[0].URLHint, bundleID)
+	}
+}
+
+// TestURLHintIsBundleID 验证无重试（首次即成功）时 URLHint == BundleID。
+func TestURLHintIsBundleID(t *testing.T) {
+	config, _ := makeTestConfig(t)
+
+	const bundleID uint64 = 0x7200000000000001
+	chunk := makeTestChunk(t, []byte("no retry url hint data!!!!!!!!!!"), bundleID, 0)
+	file := makeTestFileEntry("urlhint/noretry.bin", chunk)
+
+	mock := newMockFetcher()
+	setupMockResponse(t, mock, bundleID, chunk)
+
+	dl := NewDownloaderWithFetcher(config, mock)
+	events := dl.Events()
+	var eventWg sync.WaitGroup
+	eventWg.Add(1)
+	go func() {
+		defer eventWg.Done()
+		for range events {
+		}
+	}()
+
+	err := dl.Download(context.Background(), []rman.FileEntry{file})
+	eventWg.Wait()
+
+	if err != nil {
+		t.Fatalf("Download 失败: %v", err)
+	}
+
+	mock.mu.Lock()
+	opts := append([]FetchOptions(nil), mock.requestedOpts...)
+	mock.mu.Unlock()
+	if len(opts) != 1 {
+		t.Fatalf("期望 1 次 FetchRanges 调用，实际 %d 次", len(opts))
+	}
+	if opts[0].URLHint != bundleID {
+		t.Errorf("URLHint = %d, 期望等于 BundleID %d", opts[0].URLHint, bundleID)
+	}
+}
+
+// TestEventFetchedBytes 验证 EventBundleDone.FetchedBytes 的两种口径：
+// Range 作业等于 Σ(End-Start+1)（合并后的 Range 段宽度之和，而非解压后的
+// Chunk 原始大小），整包作业等于配置的 BundleSize。
+func TestEventFetchedBytes(t *testing.T) {
+	t.Run("Range作业", func(t *testing.T) {
+		config, _ := makeTestConfig(t)
+
+		const bundleID uint64 = 0x7300000000000001
+		chunk0 := makeTestChunk(t, []byte("fetched bytes chunk zero data!!"), bundleID, 0)
+		chunk1 := makeTestChunk(t, []byte("fetched bytes chunk one data!!!"), bundleID, chunk0.compSize)
+		file := makeTestFileEntry("fetchedbytes/range.bin", chunk0, chunk1)
+
+		mock := newMockFetcher()
+		setupMockResponse(t, mock, bundleID, chunk0, chunk1)
+
+		dl := NewDownloaderWithFetcher(config, mock)
+		events := dl.Events()
+
+		var eventList []DownloadEvent
+		var eventWg sync.WaitGroup
+		eventWg.Add(1)
+		go func() {
+			defer eventWg.Done()
+			for ev := range events {
+				eventList = append(eventList, ev)
+			}
+		}()
+
+		err := dl.Download(context.Background(), []rman.FileEntry{file})
+		eventWg.Wait()
+		if err != nil {
+			t.Fatalf("Download 失败: %v", err)
+		}
+
+		wantBytes := int64(chunk0.compSize) + int64(chunk1.compSize)
+		var found bool
+		for _, ev := range eventList {
+			if done, ok := ev.(EventBundleDone); ok {
+				found = true
+				if done.FetchedBytes != wantBytes {
+					t.Errorf("EventBundleDone.FetchedBytes = %d, 期望 %d", done.FetchedBytes, wantBytes)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("缺少 EventBundleDone 事件")
+		}
+	})
+
+	t.Run("整包作业", func(t *testing.T) {
+		config, _ := makeTestConfig(t)
+
+		const bundleID uint64 = 0x7400000000000001
+		chunk := makeTestChunk(t, []byte("fetched bytes full bundle data!"), bundleID, 0)
+		file := makeTestFileEntry("fetchedbytes/full.bin", chunk)
+
+		const bundleSize = uint32(4096) // 假定 Bundle 实际总大小大于本次覆盖的字节
+
+		mock := newMockFetcher()
+		setupMockResponse(t, mock, bundleID, chunk)
+
+		config.FullBundleThreshold = 0.01 // 极低阈值，确保判定为整包
+		config.BundleSizes = map[uint64]uint32{bundleID: bundleSize}
+
+		dl := NewDownloaderWithFetcher(config, mock)
+		events := dl.Events()
+
+		var eventList []DownloadEvent
+		var eventWg sync.WaitGroup
+		eventWg.Add(1)
+		go func() {
+			defer eventWg.Done()
+			for ev := range events {
+				eventList = append(eventList, ev)
+			}
+		}()
+
+		err := dl.Download(context.Background(), []rman.FileEntry{file})
+		eventWg.Wait()
+		if err != nil {
+			t.Fatalf("Download 失败: %v", err)
+		}
+
+		var found bool
+		for _, ev := range eventList {
+			if done, ok := ev.(EventBundleDone); ok {
+				found = true
+				if done.FetchedBytes != int64(bundleSize) {
+					t.Errorf("EventBundleDone.FetchedBytes = %d, 期望等于 BundleSize %d", done.FetchedBytes, bundleSize)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("缺少 EventBundleDone 事件")
+		}
+	})
 }

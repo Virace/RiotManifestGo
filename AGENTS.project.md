@@ -1,5 +1,16 @@
 # RiotManifestGo Project Rules
 
+## Branch and Pull Request Policy
+
+- `develop` is the integration base for ongoing feature development.
+- When work needs an isolated branch, create it from the latest `develop`.
+- Integrate branches only through GitHub pull requests; do not merge a branch
+  locally and push the merge result to a shared branch.
+- Merge `develop` into `main` only when publishing a new version, and perform
+  that integration through a GitHub pull request.
+- Normal development merges stop at `develop`; do not create a release or tag
+  unless the user explicitly requests one.
+
 ## Test Fixture Policy
 
 - Do not commit Riot `.manifest` binary files to the repository. They are large

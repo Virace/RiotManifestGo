@@ -28,6 +28,8 @@ type EventBundleStart struct {
 	BundleFilename string
 	RangeCount     int
 	ChunkCount     int
+	// FullBundle 为 true 表示该 Job 走整包 GET 路径（BundleJob.FullBundle）。
+	FullBundle bool
 }
 
 // EventChunkDone 在一个 Chunk 成功解压、校验并写盘后发出。
@@ -43,6 +45,10 @@ type EventChunkDone struct {
 type EventBundleDone struct {
 	eventBase
 	BundleID uint64
+	// FetchedBytes 是本次请求实际产生的网络字节数：整包作业等于 BundleSize，
+	// Range 作业等于 Σ(End-Start+1)（即 Schedule 合并后各 Range 段的宽度之和，
+	// 不是解压后的 Chunk 原始大小）。
+	FetchedBytes int64
 }
 
 // EventRetry 在 BundleJob 失败后重试时发出。

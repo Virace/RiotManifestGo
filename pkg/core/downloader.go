@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,17 +15,22 @@ import (
 )
 
 // netBundleFetcherAdapter 将 *netpool.BundleClient 适配为 BundleFetcher 接口。
-// 负责 core.ByteRange ↔ netpool.ByteRange 的类型转换。
+// 负责 core.ByteRange ↔ netpool.ByteRange、core.FetchOptions ↔ netpool.FetchOptions
+// 的类型转换，netpool 的实现细节不通过 BundleFetcher 接口外泄。
 type netBundleFetcherAdapter struct {
 	client *netpool.BundleClient
 }
 
-func (a *netBundleFetcherAdapter) FetchRanges(ctx context.Context, bundleFilename string, ranges []ByteRange) ([][]byte, error) {
+func (a *netBundleFetcherAdapter) FetchRanges(ctx context.Context, bundleFilename string, ranges []ByteRange, opts FetchOptions) ([][]byte, error) {
 	npRanges := make([]netpool.ByteRange, len(ranges))
 	for i, r := range ranges {
 		npRanges[i] = netpool.ByteRange{Start: r.Start, End: r.End}
 	}
-	return a.client.FetchRanges(ctx, bundleFilename, npRanges)
+	npOpts := netpool.FetchOptions{
+		URLHint:        opts.URLHint,
+		FullBundleSize: opts.FullBundleSize,
+	}
+	return a.client.FetchRanges(ctx, bundleFilename, npRanges, npOpts)
 }
 
 func (a *netBundleFetcherAdapter) Close() {
@@ -33,8 +39,12 @@ func (a *netBundleFetcherAdapter) Close() {
 
 // DownloadConfig 是 Downloader 的配置参数。
 type DownloadConfig struct {
-	// CDNBaseURL CDN Bundle 文件的基础 URL
+	// CDNBaseURL CDN Bundle 文件的基础 URL（向后兼容单域名配置）。
 	CDNBaseURL string
+
+	// CDNBaseURLs 多域名候选列表，用于跨域名分摊流量；非空时优先于 CDNBaseURL。
+	// 请求按 URLHint % len(CDNBaseURLs) 取模选取域名（见 netpool.BundleClient）。
+	CDNBaseURLs []string
 
 	// OutputDir 输出目录
 	OutputDir string
@@ -58,6 +68,18 @@ type DownloadConfig struct {
 	// RetryWait × 2^(N-1)，单次等待封顶 maxRetryWait 与 RetryWait 中的较大者。
 	// CDN 冷对象回源（暂态 404）场景可调大该值拉长重试窗口。
 	RetryWait time.Duration
+
+	// FullBundleThreshold 触发整包 GET 路径的覆盖率阈值（Schedule 判定用）；
+	// <=0（默认零值）禁用整包路径。建议值见 SuggestedFullBundleThreshold。
+	FullBundleThreshold float64
+
+	// BundleSizes 是整包覆盖率判定的分母（Bundle 总字节数，对应
+	// rman.Manifest.BundleSizes）；nil 时任何 Bundle 都不会被判定为整包。
+	BundleSizes map[uint64]uint32
+
+	// DialContext 自定义拨号函数，透传给 netpool.ClientConfig（如 edge 层接管
+	// 连接建立）；为 nil 时使用 netpool 默认拨号器。
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // Downloader 是下载管线的顶层协调器。
@@ -73,9 +95,21 @@ type Downloader struct {
 }
 
 // NewDownloader 创建一个新的下载协调器。
+//
+// 域名列表归一化：CDNBaseURLs 非空时优先使用；为空时回退到单元素
+// []string{config.CDNBaseURL}，保证传给 netpool.NewBundleClient 的 BaseURLs
+// 永不为空（netpool 对空 BaseURLs 显式 panic，见 netpool.NewBundleClient）。
 func NewDownloader(config DownloadConfig) *Downloader {
+	urls := config.CDNBaseURLs
+	if len(urls) == 0 {
+		urls = []string{config.CDNBaseURL}
+	}
 	client := &netBundleFetcherAdapter{
-		client: netpool.NewBundleClient(config.CDNBaseURL, config.Workers),
+		client: netpool.NewBundleClient(netpool.ClientConfig{
+			BaseURLs:    urls,
+			Workers:     config.Workers,
+			DialContext: config.DialContext,
+		}),
 	}
 	return newDownloader(config, client)
 }
@@ -209,8 +243,10 @@ type TaskOptions struct {
 // 未确认写入完整，就不能判定它可信，不能提交为最终文件。
 func (d *Downloader) DownloadTasks(ctx context.Context, taskMap map[uint64][]GlobalChunkTask, opts TaskOptions) (map[string]bool, error) {
 	jobs := Schedule(taskMap, ScheduleConfig{
-		MaxRangesPerReq: d.config.MaxRangesPerReq,
-		GapTolerance:    d.config.GapTolerance,
+		MaxRangesPerReq:     d.config.MaxRangesPerReq,
+		GapTolerance:        d.config.GapTolerance,
+		FullBundleThreshold: d.config.FullBundleThreshold,
+		BundleSizes:         d.config.BundleSizes,
 	})
 
 	jobCh := make(chan BundleJob, len(jobs))
@@ -447,7 +483,7 @@ func (d *Downloader) processBundleWithRetry(ctx context.Context, job BundleJob) 
 				return ctx.Err()
 			}
 		}
-		lastErr = d.processBundle(ctx, job)
+		lastErr = d.processBundle(ctx, job, attempt)
 		if lastErr == nil {
 			return nil
 		}
@@ -462,7 +498,11 @@ func (d *Downloader) processBundleWithRetry(ctx context.Context, job BundleJob) 
 //
 // 关键：使用绝对偏移（BundleOffset - RangeStart）读取 Chunk 数据，
 // 兼容 Gap Tolerance 产生的间隙字节。
-func (d *Downloader) processBundle(ctx context.Context, job BundleJob) error {
+//
+// attempt 是本次尝试在 processBundleWithRetry 重试循环中的序号（0-based，
+// 首次尝试为 0），用于组装 FetchOptions.URLHint = BundleID + attempt，让
+// 相邻两次尝试落在不同候选域名上（多域名重试轮转）。
+func (d *Downloader) processBundle(ctx context.Context, job BundleJob, attempt int) error {
 	chunkCount := 0
 	for _, r := range job.Ranges {
 		chunkCount += len(r.Chunks)
@@ -473,14 +513,23 @@ func (d *Downloader) processBundle(ctx context.Context, job BundleJob) error {
 		BundleFilename: job.BundleFilename,
 		RangeCount:     len(job.Ranges),
 		ChunkCount:     chunkCount,
+		FullBundle:     job.FullBundle,
 	})
 
 	byteRanges := make([]ByteRange, len(job.Ranges))
+	var fetchedBytes int64
 	for i, r := range job.Ranges {
 		byteRanges[i] = ByteRange{Start: int64(r.Start), End: int64(r.End)}
+		fetchedBytes += int64(r.End) - int64(r.Start) + 1
 	}
 
-	rangeDatas, err := d.client.FetchRanges(ctx, job.BundleFilename, byteRanges)
+	opts := FetchOptions{URLHint: job.BundleID + uint64(attempt)}
+	if job.FullBundle {
+		opts.FullBundleSize = int64(job.BundleSize)
+		fetchedBytes = int64(job.BundleSize)
+	}
+
+	rangeDatas, err := d.client.FetchRanges(ctx, job.BundleFilename, byteRanges, opts)
 	if err != nil {
 		return fmt.Errorf("下载 Bundle %s 失败: %w", job.BundleFilename, err)
 	}
@@ -554,6 +603,6 @@ func (d *Downloader) processBundle(ctx context.Context, job BundleJob) error {
 		}
 	}
 
-	d.emit(EventBundleDone{BundleID: job.BundleID})
+	d.emit(EventBundleDone{BundleID: job.BundleID, FetchedBytes: fetchedBytes})
 	return nil
 }

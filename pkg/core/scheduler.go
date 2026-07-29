@@ -10,17 +10,26 @@ import (
 // 间隙 < 阈值时合并为同一 Range，多下载少量无用字节换取更少的段数。
 const DefaultGapTolerance uint32 = 32 * 1024
 
+// SuggestedFullBundleThreshold 是显式启用整包路径时的建议覆盖率阈值。
+//
+// 实测（PyManifest 16.14 KR 基准）整包不减少请求数、批量场景多下 ~3.2% 流量，
+// 因此默认禁用；启用价值在绕开 CDN multipart 行为差异与边缘缓存友好。
+const SuggestedFullBundleThreshold = 0.7
+
 // ScheduleConfig 是 Schedule 函数的配置参数。
 type ScheduleConfig struct {
-	MaxRangesPerReq int    // 单个 HTTP Range 请求的最大非连续段数（默认 30）
-	GapTolerance    uint32 // 间隙容忍阈值（默认 32KB）
+	MaxRangesPerReq     int               // 单个 HTTP Range 请求的最大非连续段数（默认 30）
+	GapTolerance        uint32            // 间隙容忍阈值（默认 32KB）
+	FullBundleThreshold float64           // 触发整包作业的覆盖率阈值；<=0（含零值）禁用整包判定
+	BundleSizes         map[uint64]uint32 // 整包覆盖率判定的分母（Bundle 总字节数）；nil 或缺条目的 Bundle 不判整包
 }
 
 // Schedule 将 Mapper 的输出转换为可直接派发给 Worker 的 []BundleJob。
 //
 // 核心逻辑：
 //  1. 对同一 BundleID 内已排序的 []GlobalChunkTask，执行连续段合并（含 Gap Tolerance）
-//  2. 若单个 BundleJob 的 Range 数超过 maxRangesPerReq，分裂为多个 BundleJob
+//  2. 若显式启用 FullBundleThreshold 且覆盖率达标，改派单个整包作业（不拆分）
+//  3. 否则若单个 BundleJob 的 Range 数超过 maxRangesPerReq，分裂为多个 BundleJob
 func Schedule(taskMap map[uint64][]GlobalChunkTask, cfg ScheduleConfig) []BundleJob {
 	if cfg.MaxRangesPerReq <= 0 {
 		cfg.MaxRangesPerReq = 30
@@ -36,6 +45,28 @@ func Schedule(taskMap map[uint64][]GlobalChunkTask, cfg ScheduleConfig) []Bundle
 		ranges := mergeRanges(tasks, cfg.GapTolerance)
 
 		bundleFilename := fmt.Sprintf("%016X.bundle", bundleID)
+
+		// 覆盖率达到显式启用的阈值时，改派单个不带 Range 头的整包作业，
+		// 不再经 splitBundleJob（整包本来就是一个请求，不受段数上限约束）。
+		if cfg.FullBundleThreshold > 0 {
+			if size, ok := cfg.BundleSizes[bundleID]; ok && size > 0 {
+				var covered uint64
+				for _, r := range ranges {
+					covered += uint64(r.End) - uint64(r.Start) + 1
+				}
+				if float64(covered)/float64(size) >= cfg.FullBundleThreshold {
+					jobs = append(jobs, BundleJob{
+						BundleID:       bundleID,
+						BundleFilename: bundleFilename,
+						Ranges:         ranges,
+						FullBundle:     true,
+						BundleSize:     size,
+					})
+					continue
+				}
+			}
+		}
+
 		splitJobs := splitBundleJob(bundleID, bundleFilename, ranges, cfg.MaxRangesPerReq)
 		jobs = append(jobs, splitJobs...)
 	}

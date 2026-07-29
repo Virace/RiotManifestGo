@@ -357,7 +357,7 @@ func (m *mockFetcher) addChunk(chunkID, bundleID uint64, offset uint32, compress
 	m.byBundle[filename] = append(m.byBundle[filename], chunkID)
 }
 
-func (m *mockFetcher) FetchRanges(_ context.Context, bundleFilename string, ranges []core.ByteRange) ([][]byte, error) {
+func (m *mockFetcher) FetchRanges(_ context.Context, bundleFilename string, ranges []core.ByteRange, _ core.FetchOptions) ([][]byte, error) {
 	m.mu.Lock()
 	m.callCount++
 	m.requestedRanges = append(m.requestedRanges, ranges...)

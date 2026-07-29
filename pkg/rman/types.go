@@ -86,6 +86,10 @@ type Manifest struct {
 	Params []Params
 	// Files 该 Manifest 包含的所有游戏文件列表
 	Files []FileEntry
+	// BundleSizes 是 bundleID 到该 Bundle 全部 Chunk CompressedSize 之和的映射，
+	// 即该 Bundle 最末一个 Chunk 的 BundleOffset+CompressedSize（其在 CDN 上对应的
+	// 压缩包总字节数）。chunkCount 为 0 的 Bundle 不出现在此表中。
+	BundleSizes map[uint64]uint32
 }
 
 // Header 是 RMAN 文件头的解析结果，供内部使用。

@@ -12,16 +12,20 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Virace/RiotManifestGo/pkg/core"
+	"github.com/Virace/RiotManifestGo/pkg/edge"
 	"github.com/Virace/RiotManifestGo/pkg/rman"
 	"github.com/Virace/RiotManifestGo/pkg/update"
 )
@@ -35,7 +39,7 @@ var (
 
 func main() {
 	outputDir := flag.String("o", "./output", "文件输出目录")
-	cdnURL := flag.String("u", defaultCDNURL, "CDN Bundle 基础 URL")
+	cdnURL := flag.String("u", defaultCDNURL, "CDN Bundle 基础 URL（逗号分隔可传多个域名，跨域名分摊流量）")
 	pattern := flag.String("p", "", "路径筛选（子串或正则）")
 	flags := flag.String("f", "", "Flag 过滤，逗号代表与，管道符代表或（如 de_DE,windows 或 ja_JP|ko_KR）")
 	workers := flag.Int("w", 16, "并发下载 Worker 数")
@@ -53,6 +57,12 @@ func main() {
 	verifyOnly := flag.Bool("verify-only", false, "仅校验本地文件完整性，不下载、不写盘")
 	noVerify := flag.Bool("no-verify", false, "跳过校验，将全部匹配文件当作全新内容整体下载")
 	keepRemoved := flag.Bool("keep-removed", false, "受管理安装时保留旧文件，不清理磁盘（仅可与 -install 一起使用）")
+	gapTolerance := flag.Uint("gap-tolerance", uint(core.DefaultGapTolerance), "Range 合并间隙容忍字节数（间隙小于该值的相邻 Chunk 合并为一段，多下少量字节换更少段数）")
+	maxRanges := flag.Int("max-ranges", 30, "单个 HTTP Range 请求的最大非连续段数（CDN 超过 30 段返回 400）")
+	fullBundleThreshold := flag.Float64("full-bundle-threshold", 0, "整包下载覆盖率阈值（0=禁用；启用建议 0.7：覆盖率达标的 Bundle 改为不带 Range 头的整包 GET，多下浪费字节换 multipart 兼容性）")
+	planOnly := flag.Bool("plan-only", false, "仅输出下载计划统计（作业数/整包数/段数/浪费字节/作业尺寸分位），零网络流量")
+	edgeFlag := flag.Bool("edge", false, "启用 CDN 边缘 IP 优选（多源 DNS 发现+探测打分，规避劣质节点；稳定性兜底，默认关闭）")
+	edgeWinners := flag.Int("edge-winners", 3, "边缘优选保留的节点数")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "RiotManifestGo CLI (%s, commit %s) — Riot 游戏资源清单解析与下载\n\n", version, commit)
@@ -88,6 +98,15 @@ func main() {
 		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 		os.Exit(1)
 	}
+
+	// flag.Uint 底层是平台 uint（64 位平台下宽于 uint32），而 DownloadConfig.GapTolerance
+	// 与 ScheduleConfig.GapTolerance 均为 uint32，超限值会静默截断，因此显式校验拒绝。
+	if uint64(*gapTolerance) > math.MaxUint32 {
+		fmt.Fprintf(os.Stderr, "❌ -gap-tolerance 超出 uint32 范围（最大 %d）: %d\n", uint32(math.MaxUint32), *gapTolerance)
+		os.Exit(1)
+	}
+	gapToleranceU32 := uint32(*gapTolerance)
+	cdnURLs := parseCDNURLs(*cdnURL)
 
 	if manifestSource == "" {
 		flag.Usage()
@@ -128,6 +147,20 @@ func main() {
 		return
 	}
 
+	// 3.5 plan-only：零网络流量的下载计划统计。与 -p/-f 及全部粒度 flag 组合生效，
+	// 计算路径与真实下载共用 core.Map/core.Schedule，不发起任何网络请求。
+	if *planOnly {
+		taskMap := core.Map(files)
+		jobs := core.Schedule(taskMap, core.ScheduleConfig{
+			MaxRangesPerReq:     *maxRanges,
+			GapTolerance:        gapToleranceU32,
+			FullBundleThreshold: *fullBundleThreshold,
+			BundleSizes:         manifest.BundleSizes,
+		})
+		printPlanSummary(printer, summarizePlan(jobs))
+		return
+	}
+
 	opts := buildSyncOptions(updateMode, *install, *updatePath, *keepRemoved)
 	if err := guardStandaloneManagedRoot(*outputDir, opts.Operation, updateMode); err != nil {
 		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
@@ -145,7 +178,11 @@ func main() {
 	printer.info("   声明总大小: %s\n", humanSize(int64(totalDeclaredSize)))
 	printer.info("   操作: %s\n", operationDescription(opts.Operation))
 	printer.info("   模式: %s\n", modeDescription(updateMode))
-	printer.info("   CDN: %s\n", *cdnURL)
+	cdnDisplay := *cdnURL
+	if len(cdnURLs) > 0 {
+		cdnDisplay = strings.Join(cdnURLs, ", ")
+	}
+	printer.info("   CDN: %s\n", cdnDisplay)
 	printer.info("   Worker 数: %d\n\n", *workers)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -159,16 +196,51 @@ func main() {
 		cancel()
 	}()
 
-	dl := core.NewDownloader(core.DownloadConfig{
-		CDNBaseURL:      *cdnURL,
-		OutputDir:       *outputDir,
-		Workers:         *workers,
-		MaxFileHandles:  500,
-		MaxRangesPerReq: 30,
-		GapTolerance:    core.DefaultGapTolerance,
-		MaxRetries:      *maxRetries,
-		RetryWait:       *retryWait,
-	})
+	// 5. 边缘优选（-edge，默认关闭）：以 BundleSizes 中挑选的探测目标为基准，
+	// 对 cdnURLs 的每个域名做候选发现+探测打分，成功则用 selector.DialContext
+	// 接管后续 Bundle 请求的拨号；发现/探测全灭、初始化失败均回退系统 DNS，
+	// 不中断下载——dialContext 保持 nil 时 DownloadConfig 走 netpool 默认拨号。
+	var dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	if *edgeFlag {
+		if probeID, ok := pickProbeBundle(manifest.BundleSizes); ok {
+			probeURLs := make([]string, len(cdnURLs))
+			for i, u := range cdnURLs {
+				probeURLs[i] = u + "/" + core.BundleFilename(probeID)
+			}
+			var logf func(string, ...any)
+			if *verbose >= 2 && !*silent {
+				logf = func(f string, a ...any) { fmt.Printf("  [EDGE] "+f+"\n", a...) }
+			}
+			selector, err := edge.NewSelector(edge.Config{ProbeURLs: probeURLs, Winners: *edgeWinners, Logf: logf})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "⚠️  边缘优选初始化失败，回退系统 DNS: %v\n", err)
+			} else {
+				selector.Start(ctx)
+				if ws := selector.Winners(); len(ws) == 0 {
+					printer.info("⚠️  边缘优选未发现可用节点，回退系统 DNS\n")
+				} else {
+					printer.info("🌐 边缘优选启用: %d 个节点 %v\n", len(ws), ws)
+					dialContext = selector.DialContext
+				}
+			}
+		}
+	}
+
+	dlConfig := core.DownloadConfig{
+		CDNBaseURL:          *cdnURL,
+		CDNBaseURLs:         cdnURLs,
+		OutputDir:           *outputDir,
+		Workers:             *workers,
+		MaxFileHandles:      500,
+		MaxRangesPerReq:     *maxRanges,
+		GapTolerance:        gapToleranceU32,
+		MaxRetries:          *maxRetries,
+		RetryWait:           *retryWait,
+		FullBundleThreshold: *fullBundleThreshold,
+		BundleSizes:         manifest.BundleSizes,
+		DialContext:         dialContext,
+	}
+	dl := core.NewDownloader(dlConfig)
 
 	dlLog := &downloadLog{startTime: time.Now(), files: files}
 	go consumeEvents(dl.Events(), dlLog, printer)
@@ -207,7 +279,7 @@ func main() {
 	// 保存日志
 	if *logFile != "" {
 		dlLog.elapsed = elapsed
-		if writeErr := saveLog(*logFile, dlLog, stats, opts.Operation, updateMode, files, *verbose); writeErr != nil {
+		if writeErr := saveLog(*logFile, dlLog, stats, opts.Operation, updateMode, files, *verbose, dlConfig); writeErr != nil {
 			fmt.Fprintf(os.Stderr, "⚠️  保存日志失败: %v\n", writeErr)
 		} else {
 			printer.info("📝 日志已保存: %s\n", *logFile)
@@ -248,6 +320,7 @@ type downloadLog struct {
 	chunksProcessed  int
 	bytesDownloaded  int64
 	bytesReused      int64
+	bytesFetched     int64 // Σ EventBundleDone.FetchedBytes：实际网络流量（含 Range 合并/整包多下的字节）
 	bundlesProcessed int
 	bundlesFailed    int
 	retries          int
@@ -290,13 +363,18 @@ func consumeEvents(events <-chan core.DownloadEvent, dl *downloadLog, printer *o
 			dl.mu.Lock()
 			dl.mu.Unlock()
 			if printer.verbose >= 1 {
-				printer.info("  [BUNDLE] %s 开始 (%d Range, %d Chunk)\n",
-					e.BundleFilename, e.RangeCount, e.ChunkCount)
+				fullBundleMark := ""
+				if e.FullBundle {
+					fullBundleMark = "（整包）"
+				}
+				printer.info("  [BUNDLE] %s%s 开始 (%d Range, %d Chunk)\n",
+					e.BundleFilename, fullBundleMark, e.RangeCount, e.ChunkCount)
 			}
 
 		case core.EventBundleDone:
 			dl.mu.Lock()
 			dl.bundlesProcessed++
+			dl.bytesFetched += e.FetchedBytes
 			dl.mu.Unlock()
 			if printer.verbose >= 1 {
 				printer.info("  [BUNDLE] %016X 完成\n", e.BundleID)
@@ -660,7 +738,7 @@ func printSyncSummary(printer *outputPrinter, operation update.Operation, mode u
 
 // ---- 日志保存 ----
 
-func saveLog(path string, dl *downloadLog, stats update.Stats, operation update.Operation, mode update.Mode, files []rman.FileEntry, verboseLevel int) error {
+func saveLog(path string, dl *downloadLog, stats update.Stats, operation update.Operation, mode update.Mode, files []rman.FileEntry, verboseLevel int, cfg core.DownloadConfig) error {
 	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
 		os.MkdirAll(dir, 0755)
@@ -696,6 +774,12 @@ func saveLog(path string, dl *downloadLog, stats update.Stats, operation update.
 	sb.WriteString(fmt.Sprintf("  耗时: %s\n", dl.elapsed.Round(time.Millisecond)))
 	sb.WriteString(fmt.Sprintf("  本地复用: %s\n", humanSize(stats.ReusedBytes)))
 	sb.WriteString(fmt.Sprintf("  网络下载: %s\n", humanSize(stats.DownloadedBytes)))
+	sb.WriteString(fmt.Sprintf("  实际网络流量: %s\n", humanSize(dl.bytesFetched)))
+	wastedBytes := dl.bytesFetched - dl.bytesDownloaded
+	if wastedBytes < 0 {
+		wastedBytes = 0
+	}
+	sb.WriteString(fmt.Sprintf("  合并/整包多下: %s\n", humanSize(wastedBytes)))
 	sb.WriteString(fmt.Sprintf("  跳过: %d\n", len(stats.Skipped)))
 	sb.WriteString(fmt.Sprintf("  修复/补丁: %d\n", len(stats.Patched)))
 	sb.WriteString(fmt.Sprintf("  新建: %d\n", len(stats.Created)))
@@ -713,8 +797,10 @@ func saveLog(path string, dl *downloadLog, stats update.Stats, operation update.
 
 	if verboseLevel >= 1 {
 		sb.WriteString("\n## 详细信息\n\n")
-		sb.WriteString("  Worker 数: 默认\n")
-		sb.WriteString(fmt.Sprintf("  Gap Tolerance: %d KB\n", core.DefaultGapTolerance/1024))
+		sb.WriteString(fmt.Sprintf("  Worker 数: %d\n", cfg.Workers))
+		sb.WriteString(fmt.Sprintf("  Gap Tolerance: %d KB\n", cfg.GapTolerance/1024))
+		sb.WriteString(fmt.Sprintf("  Max Ranges: %d\n", cfg.MaxRangesPerReq))
+		sb.WriteString(fmt.Sprintf("  Full Bundle Threshold: %.2f\n", cfg.FullBundleThreshold))
 	}
 
 	if len(stats.Failed) > 0 {
@@ -780,7 +866,123 @@ func printFileList(files []rman.FileEntry, limit int) {
 		len(files), humanSize(int64(totalSize)), totalChunks, len(uniqueBundles))
 }
 
+// ---- 下载计划统计 ----
+
+// planSummary 是 -plan-only 输出的下载计划统计口径。
+type planSummary struct {
+	Jobs           int   // 作业总数
+	FullBundleJobs int   // 整包 GET 作业数
+	Segments       int   // 非整包作业的 Range 段数合计（整包请求不带 Range 头，不计段）
+	UsefulBytes    int64 // Σ Chunk CompressedSize：写盘所需的有效压缩字节
+	FetchedBytes   int64 // 实际将请求的网络字节：整包作业取 BundleSize，Range 作业取段宽合计
+	P50, P90, Max  int64 // 每作业 Fetched 字节分位（升序取 idx=len*50/100、len*90/100，Max=末位）
+}
+
+// summarizePlan 把调度产出的 BundleJob 列表汇总为 planSummary。
+// FetchedBytes 与 UsefulBytes 的差值即 Range 间隙合并与整包下载多拉取的浪费字节。
+func summarizePlan(jobs []core.BundleJob) planSummary {
+	var s planSummary
+	s.Jobs = len(jobs)
+	perJob := make([]int64, 0, len(jobs))
+	for _, job := range jobs {
+		var fetched int64
+		if job.FullBundle {
+			s.FullBundleJobs++
+			fetched = int64(job.BundleSize)
+		} else {
+			s.Segments += len(job.Ranges)
+			for _, r := range job.Ranges {
+				fetched += int64(r.End) - int64(r.Start) + 1
+			}
+		}
+		for _, r := range job.Ranges {
+			for _, c := range r.Chunks {
+				s.UsefulBytes += int64(c.CompressedSize)
+			}
+		}
+		s.FetchedBytes += fetched
+		perJob = append(perJob, fetched)
+	}
+	if len(perJob) > 0 {
+		sort.Slice(perJob, func(i, j int) bool { return perJob[i] < perJob[j] })
+		s.P50 = perJob[len(perJob)*50/100]
+		s.P90 = perJob[len(perJob)*90/100]
+		s.Max = perJob[len(perJob)-1]
+	}
+	return s
+}
+
+// printPlanSummary 打印 plan-only 计划统计，多下占比以实际请求字节为基数。
+func printPlanSummary(printer *outputPrinter, s planSummary) {
+	printer.info("📋 下载计划统计（零网络流量）\n")
+	printer.info("   作业数: %d（整包 %d）\n", s.Jobs, s.FullBundleJobs)
+	printer.info("   Range 段数: %d\n", s.Segments)
+	printer.info("   有效字节: %s\n", humanSize(s.UsefulBytes))
+	printer.info("   实际请求字节: %s\n", humanSize(s.FetchedBytes))
+	wasted := s.FetchedBytes - s.UsefulBytes
+	if wasted < 0 {
+		wasted = 0
+	}
+	pct := 0.0
+	if s.FetchedBytes > 0 {
+		pct = float64(wasted) / float64(s.FetchedBytes) * 100
+	}
+	printer.info("   合并/整包多下: %s（占实际请求 %.1f%%）\n", humanSize(wasted), pct)
+	printer.info("   作业尺寸分位: P50 %s / P90 %s / Max %s\n",
+		humanSize(s.P50), humanSize(s.P90), humanSize(s.Max))
+}
+
+// ---- 边缘优选（-edge） ----
+
+// probeBundleMinSize 是 pickProbeBundle 挑选探测目标的尺寸门槛，与
+// edge.Config.ProbeBytes 的默认值（1MiB）一致：选够 1MiB 的 Bundle 才能让探测
+// 请求的 Range 落在真实数据区间内，避免探测体裁得比请求还短。
+const probeBundleMinSize = 1 << 20
+
+// pickProbeBundle 从 BundleSizes 选探测目标：>=1MB 的最小者，全部 <1MB 则取最大者；
+// 同尺寸按 BundleID 小者优先（map 遍历无序，保证确定性）；空表返回 false。
+func pickProbeBundle(sizes map[uint64]uint32) (uint64, bool) {
+	if len(sizes) == 0 {
+		return 0, false
+	}
+
+	var haveGE bool
+	var geID uint64
+	var geSize uint32
+	var haveMax bool
+	var maxID uint64
+	var maxSize uint32
+
+	for id, size := range sizes {
+		if !haveMax || size > maxSize || (size == maxSize && id < maxID) {
+			maxID, maxSize, haveMax = id, size, true
+		}
+		if size >= probeBundleMinSize {
+			if !haveGE || size < geSize || (size == geSize && id < geID) {
+				geID, geSize, haveGE = id, size, true
+			}
+		}
+	}
+
+	if haveGE {
+		return geID, true
+	}
+	return maxID, true
+}
+
 // ---- 工具函数 ----
+
+// parseCDNURLs 解析 -u 的逗号分隔多域名值：按逗号切分、去首尾空白、丢弃空项。
+// 全部为空时返回 nil。
+func parseCDNURLs(s string) []string {
+	var urls []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			urls = append(urls, p)
+		}
+	}
+	return urls
+}
 
 // humanCount 返回带千位分隔符的十进制计数（如 787480 -> "787,480"）。
 func humanCount(n int) string {
@@ -820,6 +1022,8 @@ func extractManifestArg(args []string) (manifest string, remaining []string) {
 		"-o": true, "-u": true, "-p": true, "-f": true,
 		"-w": true, "-n": true, "-log": true, "-retry": true, "-v": true,
 		"-update": true, "-retry-wait": true,
+		"-gap-tolerance": true, "-max-ranges": true, "-full-bundle-threshold": true,
+		"-edge-winners": true,
 	}
 
 	remaining = make([]string, 0, len(args))

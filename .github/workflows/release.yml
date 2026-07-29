@@ -64,6 +64,13 @@ jobs:
       - name: Run Unit and Component Tests
         run: go test ./... -count=1
 
+      - name: Run Riot CDN Multi-Range Integration
+        run: >-
+          go test -tags=integration ./internal/netpool
+          -run '^TestRiotCDNDefaultAssetsMultiRange$'
+          -count=1
+          -timeout=6m
+
       - name: Initialize Fixture Cache
         shell: pwsh
         run: ./scripts/init-fixtures.ps1

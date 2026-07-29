@@ -10,6 +10,7 @@ import (
 	"net/textproto"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -184,25 +185,190 @@ func TestFetchRanges_MultiRange(t *testing.T) {
 	}
 }
 
-// TestFetchRangesRejectsSinglePartForMultiRange verifies that a malformed 206
-// response cannot silently collapse multiple requested ranges into one body.
-func TestFetchRangesRejectsSinglePartForMultiRange(t *testing.T) {
+// TestFetchRanges_MultiRangeCloudFrontBoundary 验证 Riot CDN 使用未加引号且
+// 含冒号的 CloudFront boundary 时，仍能按 multipart 正确解析。
+func TestFetchRanges_MultiRangeCloudFrontBoundary(t *testing.T) {
+	const boundary = "CloudFront:1943018D7AC7E2AE58471E3C2FCCA87B"
+	body := fmt.Sprintf(
+		"--%s\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-3/16\r\n\r\n0123\r\n"+
+			"--%s\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 10-13/16\r\n\r\nABCD\r\n"+
+			"--%s--\r\n",
+		boundary,
+		boundary,
+		boundary,
+	)
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Type", "multipart/byteranges; boundary="+boundary)
 		w.WriteHeader(http.StatusPartialContent)
-		w.Write([]byte("not multipart"))
+		w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	client := NewBundleClient(srv.URL, 1)
+	defer client.Close()
+
+	result, err := client.FetchRanges(context.Background(), "cloudfront.bundle", []ByteRange{
+		{Start: 0, End: 3},
+		{Start: 10, End: 13},
+	})
+	if err != nil {
+		t.Fatalf("FetchRanges 失败: %v", err)
+	}
+	if string(result[0]) != "0123" || string(result[1]) != "ABCD" {
+		t.Fatalf("结果不匹配: %q, %q", result[0], result[1])
+	}
+}
+
+// TestFetchRangesFallsBackFromSinglePartForMultiRange 验证多 Range 请求只收到
+// 一个 206 单段响应时，会复用已返回的段并顺序补齐剩余段；同一客户端后续请求
+// 直接使用单 Range，避免每个 Bundle 都重复探测。
+func TestFetchRangesFallsBackFromSinglePartForMultiRange(t *testing.T) {
+	data := []byte("0123456789ABCDEF")
+	var mu sync.Mutex
+	var rangeHeaders []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		mu.Lock()
+		rangeHeaders = append(rangeHeaders, rangeHeader)
+		mu.Unlock()
+
+		ranges := parseRangeHeader(rangeHeader, int64(len(data)))
+		if len(ranges) == 0 {
+			http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+
+		// 多 Range 请求只返回其中第二段，模拟真实 CDN 行为。
+		selected := ranges[0]
+		if len(ranges) > 1 {
+			selected = ranges[1]
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set(
+			"Content-Range",
+			fmt.Sprintf("bytes %d-%d/%d", selected.start, selected.end, len(data)),
+		)
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(data[selected.start : selected.end+1])
 	}))
 	defer srv.Close()
 
 	client := NewBundleClient(srv.URL, 2)
 	defer client.Close()
 
-	_, err := client.FetchRanges(context.Background(), "bad.bundle", []ByteRange{
+	ranges := []ByteRange{
+		{Start: 0, End: 3},
+		{Start: 10, End: 13},
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err := client.FetchRanges(context.Background(), "fallback.bundle", ranges)
+		if err != nil {
+			t.Fatalf("第 %d 次 FetchRanges 失败: %v", attempt+1, err)
+		}
+		if string(result[0]) != "0123" || string(result[1]) != "ABCD" {
+			t.Fatalf("第 %d 次结果不匹配: %q, %q", attempt+1, result[0], result[1])
+		}
+	}
+
+	mu.Lock()
+	gotHeaders := append([]string(nil), rangeHeaders...)
+	mu.Unlock()
+	wantHeaders := []string{
+		"bytes=0-3, 10-13", // 首次多 Range 探测
+		"bytes=0-3",        // 补齐缺失的第一段
+		"bytes=0-3",        // 后续调用直接逐段请求
+		"bytes=10-13",
+	}
+	if len(gotHeaders) != len(wantHeaders) {
+		t.Fatalf("Range 请求数 = %d, want %d: %v", len(gotHeaders), len(wantHeaders), gotHeaders)
+	}
+	for i, want := range wantHeaders {
+		if gotHeaders[i] != want {
+			t.Errorf("Range 请求[%d] = %q, want %q", i, gotHeaders[i], want)
+		}
+	}
+}
+
+// TestFetchRangesFallbackUsesFullBodyOnce 验证补请求收到 200 完整体时，
+// 客户端一次切出全部 Range，不会为后续段重复下载整个 Bundle。
+func TestFetchRangesFallbackUsesFullBodyOnce(t *testing.T) {
+	data := []byte("0123456789ABCDEF")
+	var requestCount int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		ranges := parseRangeHeader(r.Header.Get("Range"), int64(len(data)))
+		if requestCount == 1 {
+			selected := ranges[0]
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set(
+				"Content-Range",
+				fmt.Sprintf("bytes %d-%d/%d", selected.start, selected.end, len(data)),
+			)
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(data[selected.start : selected.end+1])
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+	}))
+	defer srv.Close()
+
+	client := NewBundleClient(srv.URL, 2)
+	defer client.Close()
+
+	result, err := client.FetchRanges(context.Background(), "full-fallback.bundle", []ByteRange{
 		{Start: 0, End: 3},
 		{Start: 10, End: 13},
 	})
-	if err == nil {
-		t.Fatal("multi-range single-part 206 response should return error")
+	if err != nil {
+		t.Fatalf("FetchRanges 失败: %v", err)
+	}
+	if string(result[0]) != "0123" || string(result[1]) != "ABCD" {
+		t.Fatalf("结果不匹配: %q, %q", result[0], result[1])
+	}
+	if requestCount != 2 {
+		t.Fatalf("请求数 = %d, want 2", requestCount)
+	}
+}
+
+func TestFetchRangesRejectsInvalidSingleRangeMetadata(t *testing.T) {
+	tests := []struct {
+		name         string
+		contentRange string
+		body         string
+	}{
+		{name: "missing Content-Range", body: "0123"},
+		{name: "unexpected Content-Range", contentRange: "bytes 1-4/16", body: "1234"},
+		{name: "truncated body", contentRange: "bytes 0-3/16", body: "012"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				if tt.contentRange != "" {
+					w.Header().Set("Content-Range", tt.contentRange)
+				}
+				w.WriteHeader(http.StatusPartialContent)
+				w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
+
+			client := NewBundleClient(srv.URL, 1)
+			defer client.Close()
+
+			_, err := client.FetchRanges(
+				context.Background(),
+				"invalid.bundle",
+				[]ByteRange{{Start: 0, End: 3}},
+			)
+			if err == nil {
+				t.Fatal("无效单 Range 元数据应返回 error")
+			}
+		})
 	}
 }
 
@@ -404,27 +570,62 @@ func TestFetchRanges_ContextCancel(t *testing.T) {
 
 // TestParseMultipartResponse 验证 multipart 解析边界情况。
 func TestParseMultipartResponse(t *testing.T) {
-	// 手动构造 multipart body
+	// 手动构造乱序 multipart body，验证结果按 Content-Range 而非响应顺序映射。
 	boundary := "testboundary"
 	body := fmt.Sprintf(
-		"--%s\r\nContent-Type: application/octet-stream\r\n\r\npart1data\r\n"+
-			"--%s\r\nContent-Type: application/octet-stream\r\n\r\npart2data\r\n"+
+		"--%s\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 10-13/16\r\n\r\nABCD\r\n"+
+			"--%s\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-3/16\r\n\r\n0123\r\n"+
 			"--%s--\r\n",
 		boundary, boundary, boundary,
 	)
 
-	result, err := parseMultipartResponse(strings.NewReader(body), boundary, 2)
+	result, err := parseMultipartResponse(strings.NewReader(body), boundary, []ByteRange{
+		{Start: 0, End: 3},
+		{Start: 10, End: 13},
+	})
 	if err != nil {
 		t.Fatalf("parseMultipartResponse 失败: %v", err)
 	}
 	if len(result) != 2 {
 		t.Fatalf("期望 2 段，得到 %d", len(result))
 	}
-	if string(result[0]) != "part1data" {
-		t.Errorf("Part[0] = %q, 期望 %q", result[0], "part1data")
+	if string(result[0]) != "0123" {
+		t.Errorf("Part[0] = %q, 期望 %q", result[0], "0123")
 	}
-	if string(result[1]) != "part2data" {
-		t.Errorf("Part[1] = %q, 期望 %q", result[1], "part2data")
+	if string(result[1]) != "ABCD" {
+		t.Errorf("Part[1] = %q, 期望 %q", result[1], "ABCD")
+	}
+}
+
+func TestParseContentRange(t *testing.T) {
+	tests := []struct {
+		value string
+		want  ByteRange
+		ok    bool
+	}{
+		{value: "bytes 0-3/16", want: ByteRange{Start: 0, End: 3}, ok: true},
+		{value: "Bytes 10-13/*", want: ByteRange{Start: 10, End: 13}, ok: true},
+		{value: "", ok: false},
+		{value: "bytes 4-3/16", ok: false},
+		{value: "bytes 0-16/16", ok: false},
+		{value: "items 0-3/16", ok: false},
+	}
+
+	for _, tt := range tests {
+		got, err := parseContentRange(tt.value)
+		if tt.ok {
+			if err != nil {
+				t.Errorf("parseContentRange(%q) unexpected error: %v", tt.value, err)
+				continue
+			}
+			if got != tt.want {
+				t.Errorf("parseContentRange(%q) = %+v, want %+v", tt.value, got, tt.want)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("parseContentRange(%q) 应返回 error", tt.value)
+		}
 	}
 }
 

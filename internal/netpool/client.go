@@ -11,7 +11,9 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,10 +23,13 @@ import (
 //   - 带 Keep-Alive 的长连接池
 //   - 支持单段和多段 Range 请求
 //   - 自动解析 multipart/byteranges 响应
+//   - 兼容 CloudFront 未加引号的 multipart boundary
+//   - 多 Range 只返回部分数据时顺序补齐缺失段
 //   - 动态超时（基于请求数据量）
 type BundleClient struct {
-	httpClient *http.Client
-	baseURL    string
+	httpClient        *http.Client
+	baseURL           string
+	preferSingleRange atomic.Bool
 }
 
 // NewBundleClient 创建一个新的 Bundle HTTP 客户端。
@@ -88,7 +93,62 @@ func (c *BundleClient) FetchRanges(ctx context.Context, bundleFilename string, r
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
+	if len(ranges) > 1 && c.preferSingleRange.Load() {
+		return c.fetchSingleRanges(reqCtx, url, bundleFilename, ranges, nil)
+	}
+
+	resp, err := c.doRangeRequest(reqCtx, url, bundleFilename, rangeHeader)
+	if err != nil {
+		return nil, err
+	}
+
+	switch {
+	case resp.StatusCode == http.StatusPartialContent: // 206
+		results, parseErr := parsePartialContent(resp, ranges)
+		closeErr := resp.Body.Close()
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("关闭 Partial Content 响应失败: %w", closeErr)
+		}
+		if allRangesPresent(results) {
+			return results, nil
+		}
+		if len(ranges) == 1 {
+			return nil, fmt.Errorf("单段 Range 响应未完整覆盖请求范围 [%d-%d]", ranges[0].Start, ranges[0].End)
+		}
+
+		// RFC 9110 允许服务器只满足多 Range 请求的一部分。检测到这种响应后，
+		// 当前客户端会话后续直接使用单 Range 请求，避免每个 Bundle 都先探测失败。
+		c.preferSingleRange.Store(true)
+		return c.fetchSingleRanges(reqCtx, url, bundleFilename, ranges, results)
+	case resp.StatusCode == http.StatusOK: // 200
+		body, err := io.ReadAll(resp.Body)
+		closeErr := resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("读取完整响应失败: %w", err)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("关闭完整响应失败: %w", closeErr)
+		}
+		return extractFromFullBody(body, ranges)
+	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable: // 416
+		resp.Body.Close()
+		return nil, fmt.Errorf("Range 不满足 (%s): 服务器返回 416", bundleFilename)
+	default:
+		resp.Body.Close()
+		return nil, fmt.Errorf("HTTP 响应异常 (%s): status=%d", bundleFilename, resp.StatusCode)
+	}
+}
+
+func (c *BundleClient) doRangeRequest(
+	ctx context.Context,
+	url string,
+	bundleFilename string,
+	rangeHeader string,
+) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("创建 HTTP 请求失败: %w", err)
 	}
@@ -98,22 +158,82 @@ func (c *BundleClient) FetchRanges(ctx context.Context, bundleFilename string, r
 	if err != nil {
 		return nil, fmt.Errorf("HTTP 请求失败 (%s): %w", bundleFilename, err)
 	}
-	defer resp.Body.Close()
+	return resp, nil
+}
 
-	switch {
-	case resp.StatusCode == http.StatusPartialContent: // 206
-		return c.parsePartialContent(resp, len(ranges))
-	case resp.StatusCode == http.StatusOK: // 200
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("读取完整响应失败: %w", err)
-		}
-		return extractFromFullBody(body, ranges)
-	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable: // 416
-		return nil, fmt.Errorf("Range 不满足 (%s): 服务器返回 416", bundleFilename)
-	default:
-		return nil, fmt.Errorf("HTTP 响应异常 (%s): status=%d", bundleFilename, resp.StatusCode)
+// fetchSingleRanges 在现有 worker 内顺序补齐缺失 Range，不额外创建 goroutine。
+// initial 中已由首个 206 响应完整覆盖的 Range 会被直接复用。
+func (c *BundleClient) fetchSingleRanges(
+	ctx context.Context,
+	url string,
+	bundleFilename string,
+	ranges []ByteRange,
+	initial [][]byte,
+) ([][]byte, error) {
+	results := initial
+	if results == nil {
+		results = make([][]byte, len(ranges))
 	}
+
+	for i, requested := range ranges {
+		if results[i] != nil {
+			continue
+		}
+
+		resp, err := c.doRangeRequest(ctx, url, bundleFilename, buildRangeHeader([]ByteRange{requested}))
+		if err != nil {
+			return nil, err
+		}
+
+		switch resp.StatusCode {
+		case http.StatusPartialContent:
+			singleResult, parseErr := parsePartialContent(resp, []ByteRange{requested})
+			closeErr := resp.Body.Close()
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			if closeErr != nil {
+				return nil, fmt.Errorf("关闭单 Range 响应失败: %w", closeErr)
+			}
+			if singleResult[0] == nil {
+				return nil, fmt.Errorf(
+					"单段 Range 响应未完整覆盖请求范围 [%d-%d]",
+					requested.Start,
+					requested.End,
+				)
+			}
+			results[i] = singleResult[0]
+
+		case http.StatusOK:
+			// 服务器忽略 Range 时，完整响应一次即可覆盖全部请求；不要为后续每段
+			// 重复下载整个 Bundle。
+			body, readErr := io.ReadAll(resp.Body)
+			closeErr := resp.Body.Close()
+			if readErr != nil {
+				return nil, fmt.Errorf("读取完整响应失败: %w", readErr)
+			}
+			if closeErr != nil {
+				return nil, fmt.Errorf("关闭完整响应失败: %w", closeErr)
+			}
+			return extractFromFullBody(body, ranges)
+
+		case http.StatusRequestedRangeNotSatisfiable:
+			resp.Body.Close()
+			return nil, fmt.Errorf(
+				"Range 不满足 (%s): [%d-%d] 服务器返回 416",
+				bundleFilename,
+				requested.Start,
+				requested.End,
+			)
+
+		default:
+			statusCode := resp.StatusCode
+			resp.Body.Close()
+			return nil, fmt.Errorf("HTTP 响应异常 (%s): status=%d", bundleFilename, statusCode)
+		}
+	}
+
+	return results, nil
 }
 
 // Close 关闭 HTTP 客户端的空闲连接。
@@ -144,29 +264,93 @@ func buildRangeHeader(ranges []ByteRange) string {
 	return "bytes=" + strings.Join(parts, ", ")
 }
 
-func (c *BundleClient) parsePartialContent(resp *http.Response, expectedCount int) ([][]byte, error) {
+func parsePartialContent(resp *http.Response, requested []ByteRange) ([][]byte, error) {
 	contentType := resp.Header.Get("Content-Type")
 
-	mediaType, params, err := mime.ParseMediaType(contentType)
-	if err == nil && strings.HasPrefix(mediaType, "multipart/") {
-		return parseMultipartResponse(resp.Body, params["boundary"], expectedCount)
+	boundary, isMultipart, err := parseMultipartBoundary(contentType)
+	if err != nil {
+		return nil, err
 	}
-
-	if expectedCount != 1 {
-		return nil, fmt.Errorf("单段 Range 响应数量不匹配: 收到=1, 期望=%d", expectedCount)
+	if isMultipart {
+		return parseMultipartResponse(resp.Body, boundary, requested)
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("读取单段响应失败: %w", err)
 	}
-	return [][]byte{data}, nil
+	contentRange, err := parseContentRange(resp.Header.Get("Content-Range"))
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([][]byte, len(requested))
+	if err := mapRangeData(results, requested, contentRange, data); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+// parseMultipartBoundary 优先使用标准 MIME 解析器；当 CloudFront 返回未加引号、
+// 含冒号的 boundary（例如 boundary=CloudFront:ABC）时，按参数原值兼容提取。
+// 冒号在 quoted-string 中合法，但部分 Riot CDN 节点没有按标准添加引号。
+func parseMultipartBoundary(contentType string) (string, bool, error) {
+	mediaType, params, parseErr := mime.ParseMediaType(contentType)
+	if parseErr == nil {
+		if !strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
+			return "", false, nil
+		}
+		boundary := params["boundary"]
+		if boundary == "" {
+			return "", true, fmt.Errorf("multipart 响应缺少 boundary")
+		}
+		return boundary, true, nil
+	}
+
+	parts := strings.Split(contentType, ";")
+	if len(parts) == 0 ||
+		!strings.HasPrefix(strings.ToLower(strings.TrimSpace(parts[0])), "multipart/") {
+		return "", false, nil
+	}
+
+	for _, parameter := range parts[1:] {
+		key, value, ok := strings.Cut(parameter, "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), "boundary") {
+			continue
+		}
+		boundary := strings.TrimSpace(value)
+		if len(boundary) >= 2 && boundary[0] == '"' && boundary[len(boundary)-1] == '"' {
+			unquoted, err := strconv.Unquote(boundary)
+			if err != nil {
+				return "", true, fmt.Errorf(
+					"解析 multipart Content-Type %q 的 boundary 失败: %w",
+					contentType,
+					err,
+				)
+			}
+			boundary = unquoted
+		}
+		if boundary == "" || strings.ContainsAny(boundary, "\r\n") {
+			return "", true, fmt.Errorf(
+				"multipart Content-Type %q 包含无效 boundary",
+				contentType,
+			)
+		}
+		return boundary, true, nil
+	}
+
+	return "", true, fmt.Errorf(
+		"解析 multipart Content-Type %q 失败: %w",
+		contentType,
+		parseErr,
+	)
 }
 
 // parseMultipartResponse 解析 multipart/byteranges 响应。
-func parseMultipartResponse(body io.Reader, boundary string, expectedCount int) ([][]byte, error) {
+func parseMultipartResponse(body io.Reader, boundary string, requested []ByteRange) ([][]byte, error) {
 	reader := multipart.NewReader(body, boundary)
-	results := make([][]byte, 0, expectedCount)
+	results := make([][]byte, len(requested))
+	partCount := 0
 
 	for {
 		part, err := reader.NextPart()
@@ -176,18 +360,118 @@ func parseMultipartResponse(body io.Reader, boundary string, expectedCount int) 
 		if err != nil {
 			return nil, fmt.Errorf("读取 multipart 段失败: %w", err)
 		}
+		partCount++
+		if partCount > len(requested) {
+			return nil, fmt.Errorf("multipart 段数超过请求数量: 收到>%d", len(requested))
+		}
 
 		data, err := io.ReadAll(part)
 		if err != nil {
 			return nil, fmt.Errorf("读取 multipart 段数据失败: %w", err)
 		}
-		results = append(results, data)
+		contentRange, err := parseContentRange(part.Header.Get("Content-Range"))
+		if err != nil {
+			return nil, fmt.Errorf("multipart 第 %d 段 Content-Range 无效: %w", partCount, err)
+		}
+		if err := mapRangeData(results, requested, contentRange, data); err != nil {
+			return nil, fmt.Errorf("multipart 第 %d 段无效: %w", partCount, err)
+		}
 	}
 
-	if len(results) != expectedCount {
-		return nil, fmt.Errorf("multipart 段数不匹配: 收到=%d, 期望=%d", len(results), expectedCount)
+	if partCount == 0 {
+		return nil, fmt.Errorf("multipart 响应不包含任何数据段")
 	}
 	return results, nil
+}
+
+func parseContentRange(value string) (ByteRange, error) {
+	fields := strings.Fields(value)
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "bytes") {
+		return ByteRange{}, fmt.Errorf("Content-Range 格式无效: %q", value)
+	}
+
+	rangeAndLength := strings.Split(fields[1], "/")
+	if len(rangeAndLength) != 2 {
+		return ByteRange{}, fmt.Errorf("Content-Range 格式无效: %q", value)
+	}
+	bounds := strings.Split(rangeAndLength[0], "-")
+	if len(bounds) != 2 {
+		return ByteRange{}, fmt.Errorf("Content-Range 范围无效: %q", value)
+	}
+
+	start, err := strconv.ParseInt(bounds[0], 10, 64)
+	if err != nil {
+		return ByteRange{}, fmt.Errorf("Content-Range 起点无效: %q", value)
+	}
+	end, err := strconv.ParseInt(bounds[1], 10, 64)
+	if err != nil || start < 0 || end < start {
+		return ByteRange{}, fmt.Errorf("Content-Range 终点无效: %q", value)
+	}
+
+	if rangeAndLength[1] != "*" {
+		completeLength, err := strconv.ParseInt(rangeAndLength[1], 10, 64)
+		if err != nil || completeLength <= end {
+			return ByteRange{}, fmt.Errorf("Content-Range 总长度无效: %q", value)
+		}
+	}
+
+	return ByteRange{Start: start, End: end}, nil
+}
+
+// mapRangeData 按 Content-Range 将响应数据映射到请求顺序。服务端合并相邻
+// Range 时，一个响应段可覆盖多个请求；只覆盖请求一部分的响应保留为空，
+// 交给单 Range 回退补齐。
+func mapRangeData(results [][]byte, requested []ByteRange, contentRange ByteRange, data []byte) error {
+	expectedLength := contentRange.End - contentRange.Start + 1
+	if int64(len(data)) != expectedLength {
+		return fmt.Errorf(
+			"Content-Range 数据长度不匹配: range=[%d-%d], data=%d",
+			contentRange.Start,
+			contentRange.End,
+			len(data),
+		)
+	}
+
+	mapped := false
+	for i, want := range requested {
+		if contentRange.Start > want.Start || contentRange.End < want.End {
+			continue
+		}
+		if results[i] != nil {
+			return fmt.Errorf("Range [%d-%d] 收到重复响应", want.Start, want.End)
+		}
+
+		start := want.Start - contentRange.Start
+		end := start + want.End - want.Start + 1
+		results[i] = data[start:end]
+		mapped = true
+	}
+	if mapped {
+		return nil
+	}
+
+	// 206 可以只返回请求范围的一个子集；这种数据不足以形成调用方需要的完整
+	// Range，但仍属于合法响应，后续会用精确单 Range 请求补齐。
+	for _, want := range requested {
+		if contentRange.Start >= want.Start && contentRange.End <= want.End {
+			return nil
+		}
+	}
+
+	return fmt.Errorf(
+		"Content-Range [%d-%d] 不属于任何请求范围",
+		contentRange.Start,
+		contentRange.End,
+	)
+}
+
+func allRangesPresent(results [][]byte) bool {
+	for _, result := range results {
+		if result == nil {
+			return false
+		}
+	}
+	return true
 }
 
 func extractFromFullBody(body []byte, ranges []ByteRange) ([][]byte, error) {

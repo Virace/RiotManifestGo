@@ -12,6 +12,7 @@ Riot 游戏资源清单（RMAN / `.manifest`）解析与下载工具的 Go 实�
 - **RMAN 清单解析**：完整解析 `.manifest` 文件（FlatBuffers + ZSTD 压缩）
 - **灵活筛选**：支持路径匹配（子串/正则）和 Flags 过滤（语言/平台）
 - **高速并发下载**：多 Worker 并行，HTTP Range 合并，ZSTD 流式解压
+- **CDN Range 兼容**：兼容 CloudFront 非标准 multipart boundary；只返回部分 `206` 时自动顺序补齐缺失段
 - **哈希校验**：支持 SHA256、SHA512、HKDF、Blake3 四种校验算法
 - **增量更新**：自动发现本地存档，按 chunk 级校验只下载新旧清单间真正变化的部分，未变化文件整个跳过、未变化数据本地复用
 - **原子写盘**：下载与本地修复统一先写临时文件、完成后原子替换，中断不会损坏已有文件
@@ -107,6 +108,17 @@ manifest-cli old.manifest -o ./output -retry 5 -retry-wait 4s -w 8
 ```
 
 `-retry 5 -retry-wait 4s` 的等待序列为 4s/8s/16s/32s/60s，总计约 2 分钟，足以覆盖多数回源暖化；`-w` 降低并发可减少限流导致的连接强制断开（`connection forcibly closed`）。
+
+### 多 Range 兼容处理
+
+部分 Riot CDN 节点返回 `multipart/byteranges` 时，CloudFront boundary 含冒号却
+未按 MIME 规范加引号。客户端会兼容提取该 boundary，并依据每段
+`Content-Range` 映射响应，不依赖 multipart 返回顺序。
+
+如果 CDN 确实只满足多 Range 请求的一部分，客户端会复用已返回的数据，并在现有
+Worker 内顺序请求缺失段；后续 Bundle 直接使用单 Range 请求，避免重复探测。
+每段响应仍需通过范围、长度、ZSTD 解压及 Chunk 哈希校验，不会把一段内容错误
+映射到多个请求范围。
 
 ## 更新模式
 

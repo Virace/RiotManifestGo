@@ -2,8 +2,9 @@
 #
 # Mirrors PyManifest scripts/e2e_update_real.py using the CLI binary:
 #   1. go test ./...                     (unit & component tests)
-#   2. go test -tags=fixtures ./pkg/rman (offline fixture parser tests)
-#   3. E2E against two pinned manifest versions from the fixture cache:
+#   2. fixed Riot CDN multi-Range integration (live manifest + bundle data)
+#   3. go test -tags=fixtures ./pkg/rman (offline fixture parser tests)
+#   4. E2E against two pinned manifest versions from the fixture cache:
 #        full download (10.9) -> corrupt + repair -> incremental update (13.12),
 #      each step finished with a chunk-level -verify-only pass (exit code based),
 #      plus a parse smoke on the latest resolved manifest.
@@ -125,6 +126,13 @@ try {
         Write-Host "== [1/5] go test ./... -count=1" -ForegroundColor Cyan
         go test ./... -count=1
         if ($LASTEXITCODE -ne 0) { throw "go test ./... failed" }
+
+        Write-Host "Running fixed Riot CDN multi-Range integration..." -ForegroundColor Cyan
+        go test -tags=integration ./internal/netpool `
+            -run '^TestRiotCDNDefaultAssetsMultiRange$' `
+            -count=1 `
+            -timeout=6m
+        if ($LASTEXITCODE -ne 0) { throw "Riot CDN multi-Range integration failed" }
     }
 
     # ---- Phase 2/5: fixture cache + offline fixture tests ----

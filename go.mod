@@ -3,7 +3,7 @@ module github.com/Virace/RiotManifestGo
 go 1.25.0
 
 require (
-	github.com/klauspost/compress v1.18.4
+	github.com/klauspost/compress v1.18.7
 	lukechampine.com/blake3 v1.4.1
 )
 
